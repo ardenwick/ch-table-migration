@@ -1,0 +1,3486 @@
+#!/bin/bash
+
+declare -g HOSTNAME=$(
+    if [[ "$USE_INTERNAL_IP" == true && -n "$SSH_CONNECTION" ]]; then
+        echo "$SSH_CONNECTION" | awk '{print$3}' # client IP, client port, server IP, server port
+    else
+        hostname -f
+    fi
+)
+
+# Logging facility
+export NORMAL=$'\e[0m' BOLD=$'\e[1m' FAINT=$'\e[2m' ITALIC=$'\e[3m' UNDERLINE=$'\e[4m' REVERSED=$'\e[7m'
+export RED=$'\e[31m' GREEN=$'\e[32m' YELLOW=$'\e[33m' BLUE=$'\e[34m' MAGENTA=$'\e[35m' CYAN=$'\e[36m' WHITE=$'\e[37m' 
+export BG_RED=$'\e[41m' BG_GREEN=$'\e[42m' BG_YELLOW=$'\e[43m' BG_BLUE=$'\e[44m' BG_MAGENTA=$'\e[45m' BG_CYAN=$'\e[46m' BG_WHITE=$'\e[47m'
+export NC=$'\e[0m' RST=$'\e[0m'
+
+export LOG_FD_STDOUT=11 LOG_FD_STDERR=12
+eval "exec $LOG_FD_STDOUT>&1 $LOG_FD_STDERR>&2"
+
+### LOGGING BLOCK FULL BEGIN
+
+# level name ==> level priority number
+declare -Ax LOG_LEVELS=( [TRACE]=1 [DEBUG]=10 [INFO]=20 [NOTIFY]=25 [WARN]=30 [ERROR]=40 [FATAL]=50 )
+# level name ==> color escape sequence
+declare -Ax LOG_COLORS=( [TRACE]="$FAINT$WHITE" [DEBUG]="$FAINT$GREEN" [INFO]="$BOLD$WHITE" [NOTIFY]="$UNDERLINE$BOLD$YELLOW" [WARN]="$BOLD$YELLOW" [ERROR]="$BOLD$RED" [FATAL]="$REVERSED$RED" )
+
+declare -ux LOG_LEVEL=${LOG_LEVEL:-INFO}
+declare -- MYPID=''
+
+function LOG()
+{
+    local MYPID=${MYPID:-$BASHPID}
+    local levelName=$1; shift; local s="$*"
+    [[ ${LOG_LEVELS[$levelName]} ]] || return 0
+    (( LOG_LEVELS[$levelName] >= LOG_LEVELS[$LOG_LEVEL] )) || return 0
+
+    local time=$(date +'%m%d %T.%2N') color=${LOG_COLORS[$levelName]}
+    echo -e "$MAGENTA$time$NC <$MAGENTA$MYPID$NC> [${color}${levelName}$NC] ${color}${s}$NC"
+}
+
+### LOGGING BLOCK PATCH BEGIN
+function log_trace(){ local MYPID=${MYPID:-$BASHPID}; ( set +x; LOG TRACE "$@" >&$LOG_FD_STDOUT ); }
+function log_debug(){ local MYPID=${MYPID:-$BASHPID}; ( set +x; LOG DEBUG "$@" >&$LOG_FD_STDOUT ); }
+function log_info(){ local MYPID=${MYPID:-$BASHPID}; ( set +x; LOG INFO "$@" >&$LOG_FD_STDOUT ); }
+function log_notify(){ local MYPID=${MYPID:-$BASHPID}; ( set +x; LOG NOTIFY "$@" >&$LOG_FD_STDOUT ); }
+function log_warn(){ local MYPID=${MYPID:-$BASHPID}; ( set +x; LOG WARN "$@" >&$LOG_FD_STDERR ); }
+function log_warning(){ local MYPID=${MYPID:-$BASHPID}; ( set +x; LOG WARN "$@" >&$LOG_FD_STDERR ); }
+function log_error(){ local MYPID=${MYPID:-$BASHPID}; ( set +x; LOG ERROR "$@" >&$LOG_FD_STDERR ); }
+function log_fatal(){ local MYPID=${MYPID:-$BASHPID}; ( set +x; LOG FATAL "$@" >&$LOG_FD_STDERR ); }
+### LOGGING BLOCK PATCH END
+
+function log_prefix() { local prefix=$1; awk "{ printf \"${MAGENTA}%s${NC}    %s %s\n\",strftime(\"%m%d %T\"),\"$prefix\",\$0 }"; }
+function log_error_prefix() { local prefix=$1; awk "{ printf \"${MAGENTA}%s${NC}    %s %s\n\",strftime(\"%m%d %T\"),\"$prefix\",\$0; fflush() }" >&2; }
+### LOGGING BLOCK FULL END
+
+function redefine_logger_for_host()
+{
+    local color=$(get_color $HOSTNAME)
+    declare -gx LOG_MARKER_FOR_HOST=''
+    if [ -z "$POD" ]; then
+        LOG_MARKER_FOR_HOST="($color$HOSTNAME$NC)"
+    else
+        color=$(get_color $POD)
+        LOG_MARKER_FOR_HOST="$color$POD$NC($color$HOSTNAME${WORKER_MODE:+:$WORKER_MODE}$NC)"
+    fi
+    function LOG()
+    {
+        local MYPID=${MYPID:-$BASHPID}
+        local levelName=$1; shift; local s="$*"
+        [[ ${LOG_LEVELS[$levelName]} ]] || return 0
+        (( ${LOG_LEVELS[$levelName]} < ${LOG_LEVELS[$LOG_LEVEL]} )) && return 0
+
+        local time=$(date +'%m%d %T.%2N') color=${LOG_COLORS[$levelName]}
+        echo -e "$MAGENTA$time$NC $LOG_MARKER_FOR_HOST <$MAGENTA$MYPID$NC> [${color}${levelName}$NC] ${color}${s}$NC"
+    }
+    function log_prefix() { local prefix=$1; awk "{ printf \"${MAGENTA}%s${NC}    %s %s %s\n\",strftime(\"%m%d %T\"),\"$LOG_MARKER_FOR_HOST\",\"$prefix\",\$0 }"; }
+    function log_error_prefix() { local prefix=$1; awk "{ printf \"${MAGENTA}%s${NC}    %s %s %s\n\",strftime(\"%m%d %T\"),\"$LOG_MARKER_FOR_HOST\",\"$prefix\",\$0; fflush() }" >&2; }
+}
+
+# log_error_and_exit <code> <message>
+function log_error_and_exit(){ local code=$1; shift; log_error "$@"; exit $code; }
+
+# Eval-able snapshot of master's logging context (colors, levels, log_* helpers). Pipe it to bash on a
+# remote host (e.g. a bastion) and log_info/log_warn/log_error work the same way as on the master.
+# LOG_FD_STDOUT/STDERR are rewritten to 2 so logs leave via the SSH stderr channel and don't taint
+# captured stdout.
+declare -gx repr_LOGGING_PATCH repr_LOGGING;
+
+[ -z "$BASH_SOURCE" ] || {
+    repr_LOGGING_PATCH=$(
+        # Pull the canonical logging block verbatim — sidesteps bash<4.4's 'declare -f' bug that rewrites
+        # '>&$VAR' as '&>$VAR' (a file redirect to a path named "2").
+        # Comment/blank lines are stripped so `$(...)`'s trailing-newline strip can't leave a dangling `#`
+        # comment that swallows the next statement when the snapshot is spliced with `;`.
+        sed -nr '/^### LOGGING BLOCK PATCH BEGIN/,/^### LOGGING BLOCK PATCH END/{/^\s*#/d;p}' "$BASH_SOURCE"
+    )
+    repr_LOGGING=$(
+        declare -p NORMAL BOLD FAINT ITALIC UNDERLINE REVERSED \
+                RED GREEN YELLOW BLUE MAGENTA CYAN WHITE \
+                BG_RED BG_GREEN BG_YELLOW BG_BLUE BG_MAGENTA BG_CYAN BG_WHITE \
+                NC RST
+        sed -nr '/^### LOGGING BLOCK FULL BEGIN/,/^### LOGGING BLOCK FULL END/{/^\s*#/d;p}' "$BASH_SOURCE"
+    )
+}
+
+function timestamp() { date +%s; }
+function timestamp_ms() { date +%s%3N; }
+function datetime() { date +'%F %T'; }
+function datetime_ms() { date +'%F %T.%3N'; }
+
+function init_tmpdir() { declare -gx TMPDIR="/tmp/crc/$TASK_SIGNATURE"; mkdir -p $TMPDIR; }
+function mktmp() { local file=$(mktemp -t crc_XXXXXX); echo $file; log_trace "Temporary file $file acquired by ${FUNCNAME[1]}"; }
+
+function get_color()
+{
+    local text="$*"; [ -z "$text" ] && text=$(cat);
+    local hash=$(( 0x$(echo "$text" | sha256sum | cut -c 1-8) ))
+
+    # Make a random RGB color that has constant brightness.
+    # https://en.wikipedia.org/wiki/YCbCr
+
+    # Note that this is darker than the middle relative luminance, see "Gamma_correction" and "Luma_(video)".
+    # It still looks awesome.
+    local y=128;
+
+    local cb=$((hash % 256));
+    local cr=$((hash / 256 % 256));
+
+    local r=$(( (y*1000 + 1402 * (cr - 128)) / 1000 )); r=$(( r <= 255 ? r : 255 )); r=$(( r > 0 ? r : 0 ));
+    local g=$(( (y*1000 - 344 * (cb - 128) - 714 * (cr - 128)) / 1000 )); g=$(( g <= 255 ? g : 255 )); g=$(( g > 0 ? g : 0 ));
+    local b=$(( (y*1000 + 1772 * (cb - 128)) / 1000 )); b=$(( b <= 255 ? b : 255 )); b=$(( b > 0 ? b : 0 ));
+
+    # ANSI escape sequence to set 24-bit foreground font color in terminal.
+    echo $'\033'"[38;2;${r};${g};${b}m";
+    # echo -e "text=$text\t y=$y\t cb=$cb\t cr=$cr\t r=$r\t g=$g\t b=$b" >&2
+}
+
+declare -g SIGNAL_QUEUE_FILE=ch-table-migration.$BASHPID.sig
+
+declare -A BACKUP_SIGNAL_ACTIONS=()
+
+function disable_signals() { for sig; do BACKUP_SIGNAL_ACTIONS[$sig]=$(trap -p $sig); trap "echo $sig >> $SIGNAL_QUEUE_FILE; log_info 'Received signal $sig'" $sig; done; }
+function restore_signals() { for sig; do eval "${BACKUP_SIGNAL_ACTIONS[$sig]:-"trap - $sig"}"; unset "BACKUP_SIGNAL_ACTIONS[$sig]"; done; }
+
+function pid_descendants()
+{
+    local include_parent=${1:-true}; shift
+    local pids=$(echo $(IFS=$'\n'; echo "${*:-$BASHPID}" | sort -u))
+    [ $include_parent == true ] && echo $pids;
+    ps -eo pid,ppid | awk -v pids="$pids" '
+        BEGIN { n = split(pids, arr); for (i=1; i<=n; i++) descendants[arr[i]]=1 }
+        {
+            if ($2 in descendants) {
+                descendants[$1]=1
+                print $1
+            }
+        }
+    '
+}
+
+function trap_kill_group(){
+    local terminate=${1:-'false'}
+    trap "
+        code=\$?; set +x;
+        trap - SIGINT SIGTERM EXIT
+        [ $terminate == true ] && kill -s SIGTERM -- -$$;
+        pid_descendants true \$(jobs -p) | xargs --no-run-if-empty kill -s SIGTERM 2> >(grep -vF 'No such process' >&2) || :
+        exit \$code
+    " SIGINT SIGTERM EXIT;
+}
+function trap_restore_kill_group(){ trap - SIGINT SIGTERM EXIT; }
+
+function wait_pids_patiently()
+{
+    local initial_interval=$1 pids=( $2 ) names=( $3 ) regex_pattern="${4:-.*}"
+    local N=${#pids[@]} ret=0
+
+    if [ $N == 0 ]; then return; fi
+    if [ $N -gt 1 ]; then
+        log_debug "Will wait for $N pids ${pids[*]}, each named ${names[*]}"
+    else
+        log_debug "Will wait for pid ${pids[*]} named ${names[*]}"
+    fi
+
+    local interval=$initial_interval last=$(timestamp_ms) last_remaining=""
+    while true; do
+        sleep 0.2
+        local i=0 remaining=""
+        while (( i < N )); do
+            local pid=${pids[i]}
+            if [ -n "$pid" ]; then
+                if [ -e /proc/$pid ] && grep -Pqe "$regex_pattern" /proc/$pid/cmdline 2>/dev/null; then
+                    remaining+="${names[i]}($pid) "
+                else
+                    if ! wait $pid; then ret=1; fi
+                    pids[i]=''
+                fi
+            fi
+            ((++i));
+        done
+        if [ -z "$remaining" ]; then break; fi
+
+        if (($(timestamp_ms) - last > interval * 1000)); then
+            log_debug "Still waiting for $(echo $remaining | wc -w) PIDs: $remaining";
+            if [ "$remaining" == "$last_remaining" ]; then
+                ((interval+=3));
+            else
+                ((interval=initial_interval));
+            fi
+            last=$(timestamp_ms) last_remaining=$remaining
+        fi
+    done
+    return $ret
+}
+
+function exit_when_orphaned()
+{
+    while true; do
+        local ppid=$(ps -o ppid= $$)
+        if [ -z "$ppid" ] || [ $ppid == 1 ]; then
+            # log_notify "Exiting as I am left orphaned." # No one listens to an orphan process
+            kill -s SIGTERM -- -$$
+        fi
+        sleep 1
+    done
+}
+
+function unindent()
+{
+    local text=$1; [ -n "$text" ] || text=$(cat)
+    text="${text##$'\n'}"
+    local indent=$(sed -nr '/^ +/{s|^( +)[^ ].*$|\1|p}' <<<"$text" | head -1)
+    sed -r "s|^$indent||g; s|^\s+$||g" <<<"$text"
+}
+
+function with_prefix() { SEP='/'; sed "s${SEP}^${SEP}$1${SEP}"; }
+function with_suffix() { SEP='/'; sed "s${SEP}\$${SEP}$1${SEP}"; }
+
+function var_defined() { declare -p "$1" >/dev/null 2>&1; }
+function func_defined() { declare -F "$1" >/dev/null 2>&1; }
+
+function variables_declaration() { for var; do declare -p $var 2>/dev/null | sed -r '1{ /^declare -[-aAfFgilrtux ]*a/{ s|\[[0-9]+\]=||g }; s|^declare |declare -g |g}'; done; }
+
+# Tricky code for function invocations by `xargs` to work.
+function bash_export_patch()
+{
+    # Declarations of indexed or associative array variables
+    declare -p $(declare -p $(compgen -A variable) | awk -vFS='=| ' '$1 ~ /^declare$/ && $2 ~ /x/ && $2 ~ /[Aa]/ {print $3}')
+    echo "$repr_LOGGING_PATCH" 
+}
+
+function variables_defined() { local names=''; for var; do [ "${!var}" == "" ] && names+="${names:+ }$var"; done; echo "$names"; [ -z "$names" ]; }
+function check_variables_defined()
+{
+    [ $# -gt 0 ] || return 0;
+    local names
+    names=$(variables_defined "$@") || {
+        log_error "${FUNCNAME[1]}: Logical error: $(plural "$names" 'required variable is' 'required variables are') not defined: $(csv_quoted $names)"
+        return 1
+    }
+}
+
+function parse_variable_assignments()
+{
+    local var=$1 expr=$2
+    declare -gA $var
+    while read -r l; do
+        IFS='=' read -r name value <<<"$l"
+        [[ -n "$name" && -n "$value" ]] || {
+            log_error "Invalid variable assignment expression: '$l'."
+            return 1
+        }
+        eval "$var[$name]=$value"
+    done <<<"$(tr , '\n' <<<"$expr")"
+}
+
+function bash_map_variable_to_awk_repr()
+{(
+    local var=$1 repr=$(declare -p "$1" 2>/dev/null) awk_repr=''
+    [ -n "$repr" ] || return 1;
+
+    eval "unset __VAR__; declare -A __VAR__=${repr#*=}"
+
+    for k in ${!__VAR__[@]}; do awk_repr+="$var[\"$k\"]=\"${__VAR__[$k]}\";"; done
+    echo "$awk_repr"
+)}
+
+function read_variable()
+{
+    local variable=$1 file=${2:-$0}
+    # shellcheck disable=SC2016
+    sed -n "/^--- BEGIN VARIABLE $variable$/,/^--- END VARIABLE $variable$/p" $file | sed -n '1n;$b;p'
+}
+
+function array_transpose() { (IFS=$'\n'; echo "$*") }
+function array_sorted() { (IFS=$'\n'; echo "$*" | sort) }
+function csv_quoted(){ QM=${QM:-"'"}; echo -n $QM; for e; do echo -n "$e"$'\1'; done | sed -r "s|\x1\$||; s|\x1|$QM,$QM|g"; echo -n $QM; }
+
+# Parses expressions "1,3,5-8,10" as "1 3 5 6 7 8 10"
+function parse_discrete_ranges()
+{
+    local range ranges;
+    local out=()
+    IFS=',' read -a ranges <<<"$1"
+    for range in ${ranges[@]}; do
+        if [[ "$range" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+            out+=( $(seq ${BASH_REMATCH[1]} ${BASH_REMATCH[2]}) )
+        else
+            out+=("$range")
+        fi
+    done
+    echo "${out[@]}"
+}
+
+# Spaces in arguments are not supported
+# This overrides EXIT signal handler
+function rm_on_exit()
+{
+    if [ $$ == $BASHPID ]; then
+        log_error "Function rm_on_exit should be invoked from within a subshell."
+        return 1;
+    fi
+    trap "rm $*" EXIT;
+}
+
+function plural(){
+    local v=$1 single=$2 plural=$3;
+    [[ "$v" =~ ^[0-9]+$ ]] || v=$(array_transpose $v | wc -l);
+    if [ "$v" -gt 1 ]; then echo "$v $plural"; else echo "$v $single"; fi;
+}
+
+function mktable(){ local sep=${1:-$'\t'}; column -t -s "$sep"; }
+
+# Query exception code
+declare -gx EXCEPTION_CODE=0
+
+function grep_exception_code() { sed -nr 's|^Code: ([0-9]+)\. DB::.+|\1|p; s|^std::exception. Code: ([0-9]+)[^0-9].+|\1|p'; }
+function grep_exception_code_no_anchor() { sed -nr 's|^.*Code: ([0-9]+)\. DB::.+|\1|p; s|^.*std::exception. Code: ([0-9]+)[^0-9].+|\1|p'; }
+
+# Space characters in arguments are not supported.
+function kube_ch()
+{
+    local pod=$1 cmd=$2 query=$3; shift 3
+    log_trace "$KUBECTL exec -i $pod -- $cmd $* --query $query"
+
+    EXCEPTION_CODE=0
+
+    local pod_color=$(get_color $pod)
+    local stderr_file=$(mktmp)
+    local exit_code_file=$(mktmp)
+
+    (
+        set +e -o pipefail;
+        $KUBECTL exec -i $pod -- bash -c "f=\$(mktemp);while [ -f \$f ];do sleep 0.02;((++i % 1000 == 0))&&echo -n ~@~@~@~HEARTBEAT~@~@~@~;done& $cmd $*;r=\$?;rm -f \$f 2>/dev/null;wait;exit \$r" 2>$stderr_file <<<"$query" | sed 's/~@~@~@~HEARTBEAT~@~@~@~//g';
+        echo $? > $exit_code_file
+    )
+
+    local ret=$(cat $exit_code_file)
+    if [ $ret != 0 ]; then
+        EXCEPTION_CODE=$(cat $stderr_file | tee >(log_prefix "[$pod_color$pod$RST]" >&2) | grep_exception_code | head -1)
+    elif [ $(stat -c %s $stderr_file) != 0 ]; then
+        ret=1;
+        log_error "Uncaught error with zero exit code but non-empty stderr content:\n$(cat $stderr_file)"
+    fi
+    log_debug "Exception code: $EXCEPTION_CODE, return: $ret."
+    rm -f $stderr_file $exit_code_file
+    return $ret
+}
+
+function kube_chc_query() { kube_ch $POD0 clickhouse-client "$@" "${CHC_FLAGS[@]}"; }
+
+function kube_chc_query_all()
+{
+    local query=$1; shift
+    log_trace "clickhouse-client ${CHC_FLAGS[*]} $* --query $query"
+
+    EXCEPTION_CODE=0
+
+    local -A stderr_files=()
+    local -a pids=()
+
+    trap_kill_group;
+    for pod in ${PODS[@]}; do
+        stderr_files[$pod]=$(mktmp)
+        if [ ${LOG_PREFIX:-false} == true ]; then
+            local pod_color=$(get_color $pod)
+            $KUBECTL exec -i $pod -- clickhouse-client "${CHC_FLAGS[@]}" "$@" 2>${stderr_files[$pod]} <<<"$query" | log_prefix "[$pod_color$pod$RST]" &
+        else
+            $KUBECTL exec -i $pod -- clickhouse-client "${CHC_FLAGS[@]}" "$@" 2>${stderr_files[$pod]} <<<"$query" &
+        fi
+        pids+=" $!"
+    done
+    wait_pids_patiently 10 "$pids" "${PODS[*]}" # Don't return from here, or stderr_files are left behind.
+    trap_restore_kill_group;
+
+    # Messy error outputs
+    local stderr_size=0
+    for f in ${stderr_files[@]}; do stderr_size=$((stderr_size + $(stat -c %s $f) )); done
+
+    if (( stderr_size > 0 )); then
+        for pod in ${!stderr_files[@]}; do
+            local pod_color=$(get_color $pod)
+            local exception_code=$(cat ${stderr_files[$pod]} | tee >(log_error_prefix "[$pod_color$pod$RST]") | grep_exception_code | head -1)
+            if ((EXCEPTION_CODE == 0 && exception_code != 0)); then EXCEPTION_CODE=$exception_code; fi
+        done
+    fi
+    rm -rf ${stderr_files[*]};
+    if [ $EXCEPTION_CODE != 0 ]; then
+        log_debug "Exception code: $EXCEPTION_CODE, return 1"
+        return 1
+    fi
+}
+
+declare -gxa CHC_FLAGS=()
+
+# Set '--name=value' flags for clickhouse-client
+function set_chc_params()
+{
+    local override=${1:-'false'}; shift;
+    local arg name value prefix regex='^([0-9]+[KMGTP])i?B?$';
+    for arg; do
+        [ -n "$arg" ] || continue
+        if [[ ! "$arg" =~ ^- ]]; then log_error "[set_chc_params] Argument to pass to clickhouse-client should start with '-' or '--'."; exit 1; fi
+        if [[ "$arg" =~ '=' ]]; then # has value
+            name=${arg%%=*}; value=${arg#*=};
+            [[ $value =~ $regex ]] && value=$(numfmt --from=iec --to=none ${BASH_REMATCH[1]}) || :;
+            prefix="$name=";
+            arg="$name=$value";
+        else
+            prefix="$arg";
+        fi
+        local i=$(
+            i=0;
+            for x in ${CHC_FLAGS[@]}; do if [[ "$x" =~ ^"$prefix" ]]; then echo $i; break; fi; ((++i)); done
+        )
+        if [ -n "$i" ]; then
+            if [ "$override" == true ]; then
+                unset "CHC_FLAGS[$i]";
+            else
+                continue;
+            fi
+        fi
+        CHC_FLAGS=( "${CHC_FLAGS[@]}" "$arg" );
+    done;
+}
+
+function distinct_engines_of_database()
+{
+    local db=$1
+    kube_chc_query "SELECT arrayStringConcat(arraySort(groupUniqArray(engine)), ',') AS engines FROM clusterAllReplicas('{cluster}',system.databases) WHERE database='$db'"
+}
+
+function are_clickhouse_servers_ready()
+{
+    log_info "Checking ClickHouse server PODs with 'SELECT 1'"
+    # Verify these are actually ClickHouse PODs
+    local chosen_server_pods=( $(array_transpose ${PODS[@]} | grep -P "$POD_REGEX") )
+    local res=$(
+        PODS=( ${chosen_server_pods[@]} )
+        kube_chc_query_all "SELECT 1"
+    )
+    regex="^1{${#chosen_server_pods[@]}}\$" # Regex to match N consecutive '1'
+
+    if ! [[ "${res//$'\n'/}" =~ $regex ]]; then
+        log_error "All chosen PODs should be healthy ClickHouse servers, but some are not responding to query 'SELECT 1'. Results: \n$res"
+        return 1;
+    fi
+}
+
+# PARTITION_CONDITION --> POD2PARTITIONIDS
+function query_matching_partition_ids()
+{
+    local result condition="database='$DB' ${TABLES:+AND table IN ( $(csv_quoted $TABLES) )} ${PARTITION_CONDITION:+AND $PARTITION_CONDITION}"
+    local query="
+        SELECT hostname() AS Host,arrayStringConcat(groupUniqArray(partition_id),',') AS \`Partition IDs\`
+        FROM clusterAllReplicas('{cluster}',system.parts)
+        WHERE match(Host,'$POD_REGEX') AND active AND $condition
+        GROUP BY Host
+        FORMAT TabSeparatedWithNames"
+
+    log_info "Querying for partitions IDs matching condition: \"$condition\""
+
+    result=$(kube_chc_query "$query")
+
+    if [ -z "$result" ]; then
+        log_error "Error retrieving partition IDs with query: $query";
+        return 1
+    else
+        log_info "$result"
+    fi
+    while read -r pod array_str; do POD2PARTITIONIDS[$pod]=$array_str; done < <(echo "$result" | tail -n+2)
+    for pod in ${CHOSEN_PODS[@]}; do [ -n "${POD2PARTITIONIDS[$pod]}" ] || POD2PARTITIONIDS[$pod]="NONE"; done
+}
+
+function check_consistency_of_objects_on_cluster()
+{(
+    set -e
+    log_info "Checking all ClickHouse servers for consistency of objects."
+    local db=${1:-$DB}
+    local pids='' names=''
+    for query in "
+        -- table columns
+        WITH
+            ( SELECT count() FROM system.clusters WHERE cluster = getMacro('cluster') ) AS count_hosts,
+            arraySort(groupArray(replaceOne(left(hostname(),-2),'chi-'||getMacro('installation')||'-'||getMacro('cluster')||'-',''))) AS hosts
+        SELECT
+            hosts,count() AS count,database,table,name,type,default_kind,default_expression
+        FROM clusterAllReplicas('{cluster}', system.columns)
+        WHERE database='$db'
+        GROUP BY database,table,name,type,default_kind,default_expression
+        HAVING count != count_hosts
+        ORDER BY count,database,table,name,type,default_kind,default_expression
+    " "
+        -- table indexes
+        WITH
+            ( SELECT count() FROM system.clusters WHERE cluster = getMacro('cluster') ) AS count_hosts,
+            arraySort(groupArray(replaceOne(left(hostname(),-2),'chi-'||getMacro('installation')||'-'||getMacro('cluster')||'-',''))) AS hosts
+        SELECT
+            hosts,count() AS count,database,table,name,type_full,expr
+        FROM clusterAllReplicas('{cluster}', system.data_skipping_indices)
+        WHERE database='$db'
+        GROUP BY database,table,name,type_full,expr
+        HAVING count != count_hosts
+        ORDER BY count,database,table,name,type_full,expr
+    " "
+        -- functions
+        WITH
+            ( SELECT count() FROM system.clusters WHERE cluster = getMacro('cluster') ) AS count_hosts,
+            arraySort(groupArray(replaceOne(left(hostname(),-2),'chi-'||getMacro('installation')||'-'||getMacro('cluster')||'-',''))) AS hosts
+        SELECT
+            hosts,count() AS count,name,create_query
+        FROM clusterAllReplicas('{cluster}', system.functions)
+        WHERE origin != 'System'
+        GROUP BY name,create_query
+        HAVING count != count_hosts
+    " "
+        -- user entities
+        WITH
+            ( SELECT count() FROM system.clusters WHERE cluster = getMacro('cluster') ) AS count_hosts,
+            arraySort(groupArray(replaceOne(left(hostname(),-2),'chi-'||getMacro('installation')||'-'||getMacro('cluster')||'-',''))) AS hosts
+        SELECT
+            hosts,count() AS count,name
+        FROM clusterAllReplicas('{cluster}', system.users)
+        GROUP BY name
+        HAVING count != count_hosts
+    " "
+        -- grants
+        WITH
+            ( SELECT count() FROM system.clusters WHERE cluster = getMacro('cluster') ) AS count_hosts,
+            arraySort(groupArray(replaceOne(left(hostname(),-2),'chi-'||getMacro('installation')||'-'||getMacro('cluster')||'-',''))) AS hosts
+        SELECT
+            hosts,count() AS count,user_name,role_name,access_type,database,table,column,is_partial_revoke,grant_option
+        FROM clusterAllReplicas('{cluster}', system.grants)
+        GROUP BY user_name,role_name,access_type,database,table,column,is_partial_revoke,grant_option
+        HAVING count != count_hosts
+        ORDER BY count,user_name,role_name,access_type,database,table,column,is_partial_revoke,grant_option
+    " "
+        -- row policies
+        WITH
+            ( SELECT count() FROM system.clusters WHERE cluster = getMacro('cluster') ) AS count_hosts,
+            arraySort(groupArray(replaceOne(left(hostname(),-2),'chi-'||getMacro('installation')||'-'||getMacro('cluster')||'-',''))) AS hosts
+        SELECT
+            hosts,count() AS count,name,database,table,select_filter,is_restrictive,apply_to_all,apply_to_list,apply_to_except
+        FROM clusterAllReplicas('{cluster}', system.row_policies)
+        GROUP BY name,database,table,select_filter,is_restrictive,apply_to_all,apply_to_list,apply_to_except
+        HAVING count != count_hosts
+        ORDER BY count,name,database,table,select_filter,is_restrictive,apply_to_all,apply_to_list,apply_to_except
+    "; do
+        local name=$(echo "$query" | awk 'NR==2{$1=""; print substr($0,2)}')
+        (
+            tmp=$(mktmp); rm_on_exit -f $tmp
+
+            kube_chc_query "$query" --format PrettyCompactMonoBlock --output_format_pretty_max_value_width=30 > $tmp
+            [ $? == 0 ] || {
+                log_error "Error checking consistency of $name."
+                return 1
+            }
+            if [ $(stat -c %s $tmp) -gt 0 ]; then
+                (
+                    flock -x 9
+                    log_error "${name^} are not consistent on cluster:$RST\n$(head -100 $tmp)"
+                    count=$(cat $tmp | wc -l)
+                    ((count <= 100)) || {
+                        echo "(+ $((count - 100)) truncated lines)"
+                    }
+                ) 9</dev/stdout
+                return 1
+            fi
+        ) &
+        pids+=" $!"; names+=" consistency-check-${name// /_}"
+    done
+    wait_pids_patiently 5 "$pids" "$names"
+)}
+
+function lock_file()
+{
+    local lockfile=$1 fd=$2 timeout=${3:-60} ret=0
+
+    if [ -f /proc/$$/fd/$fd ]; then
+        log_error "Logical error: Fd $fd has been already taken."
+        return 1
+    fi
+
+    eval "exec $fd< $lockfile"
+
+    flock -E 249 -w $timeout -x $fd; ret=$?
+
+    if [ $ret != 0 ]; then
+        if [ $ret == 249 ]; then
+            log_error "Unable to lock file '$lockfile'. Another instance is running.";
+        else
+            log_error "Unexpected error code $ret from flock."
+        fi
+        return $ret;
+    fi
+}
+
+function init_cache()
+{
+    check_variables_defined TASK_SIGNATURE || return 1
+    if [ "$NO_CACHE" == true ]; then
+        rm -rf .crc/cache/$TASK_SIGNATURE
+        return
+    fi
+    mkdir -p .crc/cache/$TASK_SIGNATURE
+    touch .crc/cache/$TASK_SIGNATURE/lock
+}
+
+function read_cache()
+{
+    local dir=".crc/cache/$TASK_SIGNATURE" file=$1
+    if [[ "$NO_CACHE" != true && -f "$file" && $(stat -c %Y $dir/$file) -le $(( $(date +%s) - 3600 )) ]]; then
+        flock -x $dir/lock cat $dir/$file
+    fi
+}
+
+function write_cache()
+{
+    local dir=".crc/cache/$TASK_SIGNATURE" file=$1
+    if [ "$NO_CACHE" != true ]; then
+        flock -x $dir/lock cat > $dir/$file
+    fi
+}
+
+function real_detect_clickhouse_credentials()
+{
+    if [ -n "$CLICKHOUSE_USER" ]; then return 0; fi
+
+    log_info "Detecting ClickHouse credentials."
+    local chi_json=$($KUBECTL get $($KUBECTL get chi -oname | head -1) -o json)
+    if [ -z "$chi_json" ]; then
+        log_error "Cannot retrieve CHI object from kubernetes"
+        return 1
+    fi
+
+    local password=''
+    # General CHI
+    local repr=''
+    repr=$($KUBECTL get cm etc-clickhouse-operator-files -o json | jq -r '.data["config.yaml"]' | sed -nr '/^  access:/,/^ ? ?[^ ]/{ /^\s+(username|password)/ { s/^/local/; s/: */=/; p } }')
+    if [[ "$repr" =~ "password" ]]; then
+        eval "$repr"
+        export CLICKHOUSE_USER=${username:-operator} CLICKHOUSE_PASSWORD=$password;
+        return 0
+    fi
+    log_error "Cannot detect ClickHouse credentials in current environment."
+    return 1
+}
+
+function detect_clickhouse_credentials()
+{
+    if [[ " ${CHC_FLAGS[*]}" =~ ' --user' ]]; then return 0; fi
+
+    eval "$(read_cache credentials)"
+    if [ -z "$CLICKHOUSE_USER" ]; then
+        real_detect_clickhouse_credentials || return;
+        variables_declaration CLICKHOUSE_USER CLICKHOUSE_PASSWORD | write_cache credentials
+    fi
+    set_chc_params true "--user=$CLICKHOUSE_USER" "${CLICKHOUSE_PASSWORD:+"--password=$CLICKHOUSE_PASSWORD"}"
+}
+
+declare -gx CLICKHOUSE_SERVER_POD_LABEL='clickhouse.altinity.com/chi'
+# Assumes clickhouse-server be the first container in POD.
+declare -gx GET_PODS_HEADER_WITH_NODE_NAME=".metadata.namespace .metadata.name .status.containerStatuses[0].containerID .spec.nodeName"
+declare -gx GET_PODS_HEADER_WITH_NODE_IP=".metadata.namespace .metadata.name .status.containerStatuses[0].containerID .status.hostIP"
+
+declare -gx PODS_INFO=''
+# Do not use CHOSEN_PODS where '--keep-placeholder-pods' is applied
+declare -gxa PODS=() CHOSEN_PODS=() CHOSEN_NODES=()
+declare -gxA POD2NODE=() NODE2POD=()
+
+# Shared kubectl + jq + namespace-disambiguation step, used by 'get_clickhouse_pods' (source side) and
+# by 'discover_remote_hosts' over SSH. Env-driven: NAMESPACE (empty => '-A'), CLICKHOUSE_SERVER_POD_LABEL,
+# GET_PODS_HEADER (jq projection), KUBECTL. Outputs one '<ns> <pod> <containerID> <node-info>' line per
+# match. Returns 1 on: missing kubectl, no PODs matched, or multiple namespaces seen in '-A' mode.
+function get_clickhouse_pods_raw()
+{
+    if ! command -v kubectl >/dev/null; then log_error "Command 'kubectl' not found."; return 1; fi
+
+    local jq_get_pods_header="${GET_PODS_HEADER// /+\" \"+}" # quote it, or you get different behavior with different bash versions.
+    local kubectl_args=() raw_result
+
+    if [ -z "$NAMESPACE" ]; then
+        log_info "Detecting namespace where ClickHouse servers live."
+        kubectl_args+=(-A)
+    else
+        log_debug "Retrieving ClickHouse server PODs from namespace '$NAMESPACE'."
+        kubectl_args+=(-n "$NAMESPACE")
+    fi
+
+    raw_result=$($KUBECTL get pods "${kubectl_args[@]}" -l "$CLICKHOUSE_SERVER_POD_LABEL" -o json | jq -r "(.items // [.])[] | $jq_get_pods_header")
+
+    if [ -z "$raw_result" ]; then
+        log_error "Not found any ClickHouse server PODs by \`$KUBECTL get pods ${kubectl_args[*]} -l $CLICKHOUSE_SERVER_POD_LABEL\`."
+        return 1
+    fi
+
+    if [ -z "$NAMESPACE" ]; then
+        local namespaces=$(echo "$raw_result" | awk '{print$1}' | sort -u)
+        if [ $(wc -l <<<"$namespaces") -gt 1 ]; then
+            log_error "Found multiple namespaces with ClickHouse server PODs: ${namespaces//$'\n'/, }."
+            return 1
+        fi
+        log_info "Found sole namespace '$namespaces'."
+    fi
+
+    echo "$raw_result"
+}
+
+# Populate variables POD2NODE, NODE2POD, PODS, CHOSEN_PODS, POD0
+function get_clickhouse_pods()
+{
+    local raw_result=$(read_cache server_pods) # information of all PODs
+
+    if [ -z "$raw_result" ]; then
+        raw_result=$(get_clickhouse_pods_raw) || return 1
+        if [ -z "$NAMESPACE" ]; then
+            # Pin KUBECTL to the auto-detected namespace so downstream kube_* calls scope to it.
+            local sole_ns=$(echo "$raw_result" | awk 'NR==1{print$1}')
+            declare -gx KUBECTL="$KUBECTL -n $sole_ns"
+        fi
+        echo "$raw_result" | write_cache server_pods;
+    fi
+
+    PODS_INFO=$(echo "$raw_result" | sed -r 's| [^ ]+://| |g') # remove docker:// containerd:// cri-o://
+
+    local pattern=$POD_REGEX_FOR_REPLICA; [ "$KEEP_PLACEHOLDER_PODS" == true ] || pattern=$POD_REGEX
+    while read _ pod _ node; do
+        [ -n "$node" ] || { log_error "Bad PODs:$RST $(PODS_INFO=$'\n'"$PODS_INFO"; declare -p PODS_INFO)"; return 1; }
+        POD2NODE[$pod]=$node; NODE2POD[$node]=$pod;
+    done <<<"$(echo "$PODS_INFO" | awk "\$2 ~ /^$pattern$/")"
+
+    PODS=( $(array_sorted ${!POD2NODE[@]}) )
+    CHOSEN_PODS=( $(array_transpose ${PODS[@]} | grep -P "$POD_REGEX") )
+    CHOSEN_NODES=( $(for pod in ${CHOSEN_PODS[@]}; do echo ${POD2NODE[$pod]}; done | sort -u) )
+
+    # Randomly pick one POD as POD0
+    local idx=$((RANDOM % ${#CHOSEN_PODS[@]}))
+    declare -gx POD0=${CHOSEN_PODS[$idx]}
+}
+
+ip_route_src(){ ip route get "${1:-8.8.8.8}" 2>/dev/null | grep -Po 'src \K\S+' | head -1; }
+
+# Populate REMOTE_HOSTS by querying the target ClickHouse cluster. Triggered by '--remote-bastion'
+# (discovery runs on the bastion via SSH) and/or '--remote-namespace' (discovery runs locally, assuming
+# same Kubernetes cluster). Filters by '--remote-k8s-label' + '--remote-shards' + '--remote-replica',
+# reads '.status.hostIP' from each matching pod, then SSHes in and asks `ip route get <master-ip>` for the
+# source IP — by construction that IP is on the network shared with our local nodes and is what they can
+# actually rsync to.
+function discover_remote_hosts()
+{
+    if [[ -z "$REMOTE_BASTION" && -z "$REMOTE_NAMESPACE" ]]; then return 0; fi
+
+    if [ -n "$REMOTE_HOSTS" ]; then
+        log_error "Option '--hosts' must NOT be combined with '--remote-bastion' or '--remote-namespace'."
+        return 1
+    fi
+
+    if [ -z "$SSH_USER" ]; then
+        log_error "Option '--user' is required for remote-host discovery (used to SSH into each remote node to determine its reachable IP)."
+        return 1
+    fi
+
+    # Master's outbound IP — each remote node will route to this and report back its own source IP.
+    local local_ip bastion_ip="${REMOTE_BASTION##*@}"  # strip user@ prefix
+    local_ip=$(ip_route_src "${bastion_ip%%:*}")      # strip :port suffix
+    if [ -z "$local_ip" ]; then
+        log_error "Could not determine local outbound IP via 'ip route get'."
+        return 1
+    fi
+    log_debug "Local outbound IP: $local_ip"
+
+    local remote_label=${REMOTE_CLICKHOUSE_SERVER_POD_LABEL:-$CLICKHOUSE_SERVER_POD_LABEL}
+    local remote_pod_regex="chi-.*-($REMOTE_SHARDS_REGEX)-($REMOTE_REPLICA_REGEX)-0"
+
+    local snippet
+    snippet=$(
+        echo "$repr_LOGGING" | LOG_FD_STDOUT=2 LOG_FD_STDERR=2 envsubst '${LOG_FD_STDOUT} ${LOG_FD_STDERR}'
+        declare -f with_prefix ip_route_src remote_bash remote_bash_default get_clickhouse_pods_raw
+        variables_declaration SSH SSH_USER SSH_PORT # Env required by remote_bash / remote_bash_default
+        variables_declaration GET_PODS_HEADER_WITH_NODE_IP
+        LABEL_VAR=$remote_label POD_REGEX_VAR=$remote_pod_regex \
+        LOCAL_IP_VAR=$local_ip \
+        envsubst '${REMOTE_NAMESPACE} ${LABEL_VAR} ${POD_REGEX_VAR} ${LOCAL_IP_VAR}' <<'BLOCK'
+set -o pipefail
+
+local_ip='${LOCAL_IP_VAR}'
+pod_regex='${POD_REGEX_VAR}'
+
+# KUBECTL=kubectl forces the bastion's own kubeconfig (no '-n source-ns' from the master).
+# GET_PODS_HEADER picks the hostIP variant so .status.hostIP lands in column 4.
+raw=$(
+    KUBECTL=kubectl
+    NAMESPACE='${REMOTE_NAMESPACE}'
+    CLICKHOUSE_SERVER_POD_LABEL='${LABEL_VAR}'
+    GET_PODS_HEADER=$GET_PODS_HEADER_WITH_NODE_IP
+    get_clickhouse_pods_raw
+) || exit 1
+
+# Filter to pods matching '--remote-shards' / '--remote-replica'.
+result=$(echo "$raw" | awk "\$2 ~ /^$pod_regex$/")
+
+if [ -z "$result" ]; then
+    log_error "No remote ClickHouse server PODs matched pod_regex='$pod_regex'."
+    exit 1
+fi
+
+# Probe ip_route_src in parallel; one tmpfile per pod -> no locking, stderr stays interleaved.
+parallel_probes=$(( $(nproc) > 32 ? 32 : $(nproc) ))
+
+tmpdir=$(mktemp -d)
+trap "rm -rf '$tmpdir'" EXIT
+
+batch_pids=()
+while read -r _ pod_name _ host_ip; do
+    [ -n "$pod_name" ] || continue
+    [ -n "$host_ip" ] || { log_error "No hostIP for pod '$pod_name'."; exit 1; }
+    (
+        # Ask the host which source IP it would use to route to the master.
+        reachable=$( echo "$(declare -f ip_route_src); ip_route_src $local_ip" | remote_bash "$host_ip" 2> >(log_error_prefix "($host_ip)") )
+        if [ -z "$reachable" ]; then
+            log_warn "Could not query reachable IP from pod '$pod_name' (tried SSH to $SSH_USER@$host_ip); falling back to hostIP."
+            reachable=$host_ip
+        fi
+        echo "$reachable" > "$tmpdir/$pod_name"
+    ) &
+    batch_pids+=($!)
+    if (( ${#batch_pids[@]} >= parallel_probes )); then
+        wait "${batch_pids[@]}"
+        batch_pids=()
+    fi
+done <<<"$result"
+
+[ ${#batch_pids[@]} -eq 0 ] || wait "${batch_pids[@]}"
+
+shopt -s nullglob
+cat "$tmpdir"/* | sort -u
+BLOCK
+    )
+
+    local discovered ret=0
+    if [ -n "$REMOTE_BASTION" ]; then
+        log_info "Discovering remote ClickHouse cluster nodes via bastion '$REMOTE_BASTION' (label='$remote_label', shards='$REMOTE_SHARDS_REGEX', replica='$REMOTE_REPLICA_REGEX', namespace='${REMOTE_NAMESPACE:-<auto>}', local_ip='$local_ip')."
+        IFS=':' read -r address port <<<"$REMOTE_BASTION"
+        # remote_bash_default (not remote_bash) so the bastion's .bashrc puts kubectl/jq on PATH.
+        discovered=$(echo "$snippet" | SSH_PORT=${port:-22} remote_bash_default "$address") || ret=$?
+    else
+        log_info "Discovering remote ClickHouse cluster nodes in namespace '$REMOTE_NAMESPACE' of the source Kubernetes cluster (label='$remote_label', shards='$REMOTE_SHARDS_REGEX', replica='$REMOTE_REPLICA_REGEX', local_ip='$local_ip')."
+        discovered=$(echo "$snippet" | bash --norc --noprofile) || ret=$?
+    fi
+
+    if [[ $ret != 0 || -z "$discovered" ]]; then
+        log_error "Failed to discover remote node IPs (exit=$ret, label='$remote_label', shards='$REMOTE_SHARDS_REGEX', replica='$REMOTE_REPLICA_REGEX', namespace='$REMOTE_NAMESPACE', bastion='$REMOTE_BASTION')."
+        return 1
+    fi
+
+    REMOTE_HOSTS=$(echo $discovered)
+    log_info "Discovered $(plural "$REMOTE_HOSTS" 'remote host' 'remote hosts'): ${REMOTE_HOSTS// /,}"
+}
+
+declare -gxA POD2DATABASE_ENGINE=()
+
+function get_database_engine_of_pods()
+{
+    # POD2DATABASE_ENGINE
+    local result db=${1:-$DB}
+    result=$(kube_chc_query "SELECT splitByChar('.',FQDN())[1] AS host,engine FROM clusterAllReplicas('{cluster}', system.databases) WHERE name='$db' ORDER BY host")
+
+    [[ $? == 0 && -n "$result" ]] || {
+        log_error "Error retrieving database engines of '$db' from servers."
+        return 1;
+    }
+    while read pod engine; do POD2DATABASE_ENGINE[$pod]=$engine; done <<<"$result"
+}
+
+function is_pod_chosen() { local pod=$1; grep -Pq "$POD_REGEX" <<<"$pod"; }
+
+declare -gxA DISK2PATH=() PATH2DISK=() PODPATH2HOSTPATH=() PODDISK2HOSTPATH=()
+
+function get_disks_and_hostpaths()
+{
+    eval "$(read_cache disks_and_hostpaths)"
+    (( ${#DISK2PATH[@]} == 0 || ${#PODPATH2HOSTPATH[@]} == 0 )) || return 0; # return if both are non-empty
+
+    [ -n "$PODS_INFO" ] || { log_error "$FUNCNAME: Variable 'PODS_INFO' is not defined."; return 1; }
+
+    # DISK2PATH PATH2DISK
+    local result
+    result=$(kube_chc_query "SELECT name,path FROM system.disks")
+    [ -n "$result" ] || { log_error "Error querying table system.disks."; return 1; }
+    while read -r name path; do path=${path%/}; DISK2PATH[$name]=$path; PATH2DISK[$path]=$name; done <<<"$result"
+
+    # Check that $CHOSEN_DISK is a valid disk name
+    [ -n "${DISK2PATH[$CHOSEN_DISK]}" ] || {
+        log_error "'$CHOSEN_DISK' is not a valid disk name from system.disks, available disk names are $(csv_quoted ${!DISK2PATH[@]})."
+        return 1
+    }
+
+    # PODPATH2HOSTPATH
+    local cmd_inspect_container="docker inspect CONTAINERID | jq -r '\"POD \" + (.[].Mounts[] | .Destination + \" \" + .Source)'"
+
+    local cri
+    cri=$($KUBECTL get node -o jsonpath='{.items[0].status.nodeInfo.containerRuntimeVersion}')
+    [ -n "$cri" ] || { log_error "Error retrieving Kubernetes container runtime version."; return 1; }
+
+    [[ "$cri" =~ 'docker' ]] || cmd_inspect_container="crictl inspect CONTAINERID | jq -r '\"POD \" + (.info.runtimeSpec.mounts[] | .destination + \" \" + .source)'"
+
+    local ret
+    result=$(
+        set +e
+        local pids='' names=''
+        while read -r _ pod containerID node; do
+            is_pod_chosen $pod || continue
+            (
+                cmd_inspect_container=${cmd_inspect_container//CONTAINERID/$containerID}
+                cmd_inspect_container=${cmd_inspect_container//POD/$pod}
+
+                pod_mounts=$(echo "$cmd_inspect_container" | remote_bash $node)
+                if [ $? != 0 ] || [ -z "$pod_mounts" ]; then
+                    log_error "Error retrieving path mounts of POD '$pod' from host '$node', with command \`$cmd_inspect_container\`"
+                    exit 1;
+                else
+                    flock -x /dev/stdout echo "$pod_mounts"
+                fi
+            ) &
+            pids+=" $!"; names+=" inspect-pod-mounts-$node"
+        done <<<"$PODS_INFO"
+        wait_pids_patiently 1 "$pids" "$names"
+    ); ret=$?
+    [ $ret == 0 ] || return $ret;
+
+    local -A pod2pathmounts=()
+    while read -r pod path host_path; do pod2pathmounts[$pod]+="$path:$host_path"$'\n'; done <<<"$result"
+
+    # Resolve final mappings on disks and path mounts:
+    # 1. <disk name> --> <host path>
+    # 2. <disk path> --> <host path>
+    # Examples:
+    #   <disk name>  <path in container>          <mount point in container>   <host path>
+    #   'default'    /var/lib/clickhouse          /var/lib/clickhouse          **/pvc-ffff
+    #   'disk1'      /tmp/clickhouse/disk1        /                            **/merged/tmp/clickhouse/disk1
+    #   'disk2'      /var/lib/clickhouse/disk2    /var/lib/clickhouse          **/pvc-ffff/disk2
+    result=$(
+        set +e
+        for pod in ${CHOSEN_PODS[@]}; do
+            local hostpathmounts=$(echo "${pod2pathmounts[$pod]}" | sort -drst: -k1)
+            (
+                local stderr=$(mktmp); rm_on_exit -f $stderr
+                result=$(
+                    LF=$'\n'
+                    echo "$(variables_declaration pod hostpathmounts DISK2PATH LF);" '
+                        set -exo pipefail
+                        writable_root=$(findmnt -T / -rno OPTIONS | tr , "\n" | grep ^upperdir | cut -d= -f2) # Only consider writable root
+                        hostpathmounts="$hostpathmounts$LF/:$writable_root"
+                        for disk in ${!DISK2PATH[@]}; do
+                            path=${DISK2PATH[$disk]}
+                            mountpoint=$(findmnt -T $path -rno TARGET) # find mountpoint of disk path
+                            relpath=${path#${mountpoint%/}}
+                            hostpath=$(echo "$hostpathmounts" | grep -m1 ^$mountpoint: | cut -d: -f2)/${relpath#/}
+                            echo $pod $disk $path ${hostpath%/}
+                        done
+                    ' \
+                    | $KUBECTL exec -i $pod -- bash 2> $stderr
+                )
+                if [ $? != 0 ] || [ -z "$result" ]; then
+                    (
+                        flock -x 100
+                        log_error "Error retrieving disk path mounts of POD '$pod'."
+                        log_debug "Stderr:$RST\n$(cat $stderr)"
+                    ) 100< /dev/stdout
+                    exit 1;
+                else
+                    flock -x /dev/stdout echo "$result"
+                fi
+            ) &
+            pids+=" $!"; names+=" resolve-disks-$pod"
+        done
+        wait_pids_patiently 1 "$pids" "$names"
+    ); ret=$?
+    [ $ret == 0 ] || return $ret;
+
+    while read -r pod disk path host_path; do
+        PODDISK2HOSTPATH[$pod-$disk]=$host_path
+        PODPATH2HOSTPATH[$pod-$path]=$host_path
+    done <<<"$result"
+
+    variables_declaration DISK2PATH PATH2DISK PODPATH2HOSTPATH PODDISK2HOSTPATH | write_cache disks_and_hostpaths
+}
+
+# Create and enter a cgroup with limited I/O bandwidth on all block devices.
+create_and_enter_cgroup()
+{
+    local cgroup_name=${1:-'crc-shared'} io_bps=$2
+    local cgroup_mount="/sys/fs/cgroup"
+    local io_bandwidth_readable=$(numfmt --from=none --to=iec $io_bps)
+    local success=0
+
+    # Must be root
+    if [ "$(id -u)" -ne 0 ]; then
+        log_error "❌ Error: must be run as root (sudo)"
+        return 1
+    fi
+
+    log_info "Creating cgroup '$cgroup_name' with IO limit ${io_bandwidth_readable}iB/s per device ..."
+
+    # Detect all block devices (disks only)
+    local devs=()
+    while read -r name type; do
+        if [ "$type" = "disk" ] && [ -b "/dev/$name" ]; then
+            devs+=("/dev/$name")
+        fi
+    done < <(lsblk -ndo NAME,TYPE)
+
+    if [ ${#devs[@]} -eq 0 ]; then
+        log_error "❌ No physical block devices found to limit."
+        return 1
+    fi
+
+    # cgroup v2
+    if [ -f "$cgroup_mount/cgroup.controllers" ]; then
+        log_info "Detected cgroup v2."
+        local cgroup_path="$cgroup_mount/$cgroup_name"
+
+        mkdir -p "$cgroup_path" || {
+            log_error "❌ Failed to create $cgroup_path"
+            return 1
+        }
+
+        # Enable io controller in parent
+        if ! grep -qw io "$cgroup_mount/cgroup.subtree_control"; then
+            echo "+io" > "$cgroup_mount/cgroup.subtree_control" 2>/dev/null || {
+                log_error "❌ Could not enable io controller at $cgroup_mount"
+                return 1
+            }
+        fi
+
+        for dev in "${devs[@]}"; do
+            local majmin
+            majmin=$(stat -c '%t:%T' "$dev" 2>/dev/null | \
+                     awk -F: '{printf "%d:%d", strtonum("0x"$1), strtonum("0x"$2)}')
+            if [ -z "$majmin" ]; then
+                log_warn "⚠️  Could not resolve major:minor for $dev"
+                continue
+            fi
+            if echo "${majmin} rbps=${io_bps} wbps=${io_bps}" >> "$cgroup_path/io.max" 2>/dev/null; then
+                log_info "  applied to $dev ($majmin)"
+                success=1
+            else
+                log_warn "⚠️  Failed to apply IO limit to $dev"
+            fi
+        done
+
+        if [ $success -eq 0 ]; then
+            log_error "❌ No IO limits applied. Permissions or unsupported devices?"
+            return 1
+        fi
+
+        echo $$ > "$cgroup_path/cgroup.procs" 2>/dev/null || \
+            log_warn "⚠️  Failed to join cgroup $cgroup_name" >&2
+
+    # cgroup v1
+    else
+        log_info "Detected cgroup v1."
+        local blkio_path="$cgroup_mount/blkio/$cgroup_name"
+
+        mkdir -p "$blkio_path" || {
+            log_error "❌ Failed to create $blkio_path"
+            return 1
+        }
+
+        for dev in "${devs[@]}"; do
+            local majmin
+            majmin=$(stat -c '%t:%T' "$dev" 2>/dev/null | \
+                     awk -F: '{printf "%d:%d", strtonum("0x"$1), strtonum("0x"$2)}')
+            if [ -z "$majmin" ]; then
+                log_warn "⚠️  Could not resolve major:minor for $dev"
+                continue
+            fi
+            if echo "$majmin $io_bps" > "$blkio_path/blkio.throttle.read_bps_device" 2>/dev/null \
+               && echo "$majmin $io_bps" > "$blkio_path/blkio.throttle.write_bps_device" 2>/dev/null; then
+                log_info "  applied to $dev ($majmin)"
+                success=1
+            else
+                log_warn "⚠️  Failed to apply IO limit to $dev"
+            fi
+        done
+
+        if [ $success -eq 0 ]; then
+            log_error "❌ No IO limits applied. Permissions or unsupported devices?"
+            return 1
+        fi
+
+        echo $$ > "$blkio_path/tasks" 2>/dev/null || \
+            log_warn "⚠️  Failed to join blkio cgroup"
+    fi
+
+    log_info "✅ Cgroup '$cgroup_name' active, ${io_bandwidth_readable}iB/s IO limit per device."
+    return 0
+}
+
+declare -gx RSYNC_STATS_FILE # Constant. Assigned after argument parsing on master node
+
+declare -gx RSYNC_STATS_VARIABLES="
+    TIMESTAMP_START
+    TOTAL SENT
+    INFLIGHT
+"
+
+unset $RSYNC_STATS_VARIABLES
+
+function lock_stats_100()
+{
+    local timeout=${1:-60} ret=0 file="$RSYNC_STATS_FILE.lock"
+    mkdir -p $(dirname $file)
+
+    touch $file
+    lock_file $file 100 $timeout
+}
+
+function init_rsync_stats()
+{
+    declare -g TIMESTAMP_START=$(timestamp)
+    declare -g TOTAL=0 SENT=0
+    declare -A INFLIGHT
+    declare -p $RSYNC_STATS_VARIABLES 2>/dev/null > $RSYNC_STATS_FILE
+}
+
+function with_stats_locked()
+{(
+    # lock-read-update-write
+    local expr=$1 timeout=${2:-86400000}
+    {
+        if ! flock -w $timeout -x 10; then
+            ((timeout == 0)) || log_error "Timeout aquiring lock on file $RSYNC_STATS_FILE, callers ${FUNCNAME[*]}"
+            return 1
+        fi
+        source $RSYNC_STATS_FILE
+        truncate -s0 $RSYNC_STATS_FILE
+        eval "$expr"
+        # For performance reason， we dont use variables_declaration
+        declare -p $RSYNC_STATS_VARIABLES 2>/dev/null >&10
+    } 10<> $RSYNC_STATS_FILE
+)}
+
+function set_stats_var() { local var=$1 value=$2 timeout=$3; with_stats_locked "$var=$value" $timeout; }
+function inc_stats_var() { local var=$1 value=$2 timeout=$3; with_stats_locked "$var=\$(($var + $value))" $timeout; }
+function set_stats_var_nonblocking() { set_stats_var "$1" "$2" 0; }
+function inc_stats_var_nonblocking() { inc_stats_var "$1" "$2" 0; }
+
+declare -gx KiB=1024
+declare -gx MiB=$((KiB*1024))
+declare -gx GiB=$((MiB*1024))
+declare -gx TiB=$((GiB*1024))
+
+# Ignorable rsync exit codes
+#   24 - Partial transfer due to vanished source files
+declare -gx RSYNC_IGNORABLE_CODES='0 24'
+
+function rsync_with_record()
+{(
+    set +e -o pipefail;
+    if var_defined XARGS_SLOT; then
+        eval "$repr_LOGGING; redefine_logger_for_host";
+    fi
+    local total_file=$(mktmp); rm_on_exit -f ${total_file:?} # exits if unset
+
+    # 1TiB / 1GiB = 1024 ==> need to update the stats file 1024 times ==> 6s
+    rsync "$@" --stats --info=progress1 \
+    | tr '\r' '\n' \
+    | awk -v batch_size_bytes=${RSYNC_STATS_BATCH_SIZE:-$((100*MiB))} -v total_file=$total_file '
+            { last=$0 }
+            /^ .+-chk=/ {
+                gsub(/,/,"",$1); acc+=$1
+                if (acc > batch_size_bytes) { print acc; fflush(); acc=0 }
+            }
+            END { print last > total_file }
+        ' \
+    | while read -r acc; do inc_stats_var INFLIGHT[P$XARGS_SLOT] $acc; done
+
+    local rc=$PIPESTATUS
+    [[ -n "$rc" && " $RSYNC_IGNORABLE_CODES " =~ " $rc " ]] || {
+        with_stats_locked "unset INFLIGHT[P$XARGS_SLOT]"
+        # log_error "rsync returned unignorable code $rc."
+        return $rc
+    }
+
+    local line=$(grep '^total size is ' $total_file)
+
+    if [ -n "$line" ]; then
+        sent=$(echo $line | cut -d' ' -f4 | tr -d ,)
+        with_stats_locked "SENT=\$((SENT+$sent)); unset INFLIGHT[P$XARGS_SLOT]"
+    else
+        with_stats_locked "unset INFLIGHT[P$XARGS_SLOT]"
+        # log_error "Not found sent files size from 'rsync' output". 
+        return 1
+    fi
+)}
+
+function remote_bash()
+{
+    local host=$1; shift
+    [[ "$host" == *@* ]] || host="$SSH_USER@$host"
+    $SSH -T -p $SSH_PORT "$host" bash --norc --noprofile "$@" 2> >(grep -vF 'Warning: Permanently added' >&2)
+}
+
+# Like remote_bash but lets the remote's login files run — needed when bashrc puts kubectl/jq on PATH.
+function remote_bash_default()
+{
+    local host=$1; shift
+    [[ "$host" == *@* ]] || host="$SSH_USER@$host"
+    $SSH -T -p $SSH_PORT "$host" "$@" 2> >(grep -vF 'Warning: Permanently added' >&2)
+}
+
+function call_remote_worker()
+{
+    local host=$1 worker=$2 env_repr=$3
+    { echo "$env_repr; declare -g WORKER_MODE=$worker"; cat "$BASH_SOURCE"; } \
+    | $SSH -T -p $SSH_PORT "$SSH_USER@$host" bash --norc --noprofile 2> >(grep -vF 'Warning: Permanently added' >&2)
+}
+
+function patch_bashrc_for_all_hosts()
+{
+    local pids='' names=''
+    for host in $(array_transpose ${!NODE2POD[@]} $REMOTE_HOSTS | grep -vE '^(localhost|127.)' | sort -u); do
+        log_info "Patching bashrc file for host $host"
+        echo "set -e; $(declare -f unindent)" '
+            ent=$(getent passwd $SSH_USER)
+            home=$(echo "$ent" | cut -d: -f6)
+
+            grep -q "SKIP_FOR_NONINTERACTIVE_SHELL" $home/.bashrc && { echo "Marker already present, nothing to do"; exit 0; }
+            [ -f $home/.bashrc.bak ] || command cp -a $home/.bashrc $home/.bashrc.bak;
+
+            unindent "
+                # SKIP_FOR_NONINTERACTIVE_SHELL BEGIN
+                [[ \$- == *i* ]] || return
+                # SKIP_FOR_NONINTERACTIVE_SHELL END
+            " \
+            | cat - $home/.bashrc > $home/.bashrc.new && command mv $home/.bashrc.new $home/.bashrc;
+        ' | envsubst '${SSH_USER}' | remote_bash $host | log_prefix $host &
+        pids+=" $!"; names+=" patch-rc-$host"
+    done
+    wait_pids_patiently 5 "$pids" "$names"
+}
+
+function create_remote_dir()
+{
+    log_info "Creating directory on remote hosts: ${REMOTE_HOSTS// /,}"
+
+    local lambda_inspect_fs="f='$REMOTE_DIR'"'; while [ "${f%/}" ]; do (set -x; file $f); f=$(dirname $f); done | column -t -s: -o: | sed "s|^|  |g"'
+
+    local pids="" names="" localhost_created=false
+    for host in $(array_transpose $REMOTE_HOSTS | sort -u); do
+
+        if [[ "$host" =~ ^('localhost'|'127.') ]]; then # each node sends data parts to itself
+            [ $localhost_created == false ] || continue
+
+            log_info "Creating directory on each node for 'localhost'."
+            for node in ${CHOSEN_NODES[@]}; do
+                echo "mkdir -p $REMOTE_DIR || { $lambda_inspect_fs >&2; exit 1; }" | remote_bash $node 2> >(log_error_prefix "(from $node)") & pids+=" $!"
+                names+=" create-dir-localhost-$node"
+            done
+            localhost_created=true
+        else
+            echo "mkdir -p $REMOTE_DIR || { $lambda_inspect_fs >&2; exit 1; }" | remote_bash $host 2> >(log_error_prefix "(from $host)") & pids+=" $!"
+            names+=" create-dir-$host"
+        fi
+    done
+    [ -z "$names" ] || wait_pids_patiently 5 "$pids" "$names"
+}
+
+function check_required_subdirectories()
+{
+    local dir=$1 names=''; shift
+    if [ ! -d "$dir" ]; then
+        log_error "Directory '$dir' does not exist."
+        return 1
+    fi
+    [ $# -gt 0 ] || set -- data store; # necessary subdirectories by default
+    for subdir; do [ -d $dir/$subdir ] || names+="${names:+ }$subdir"; done
+    [ -z "$names" ] || {
+        LOG $LOG_LEVEL "Directory '$dir' does not contain $(plural "$names" 'necessary subdirectory' 'necessary subdirectories') $(csv_quoted $names)." >&$LOG_FD_STDERR
+        return 1
+    }
+}
+
+function database_engine()
+{
+    local engine=${DATABASE_ENGINE}
+    if [ -f database_engine.txt ]; then engine=$(cat database_engine.txt); fi
+    echo ${engine:-'Atomic'}
+}
+
+function args_or_input() { local s="$*"; [ -n "$s" ] || s=$(cat); echo "$s"; }
+
+function escape_filename()
+{(
+    set +x
+    [ $# -gt 0 ] || set -- "$(cat)";
+    while (( $# > 0 )); do
+        local s=$1 res=''
+        for (( i=0; i<${#s}; i++ )); do
+            c=${s:$i:1};
+            [[ "$c" =~ [^a-zA-Z0-9_] ]] && c=$(printf '%%%02X' "'$c")
+            res+=$c;
+        done
+        echo -n "$res"
+        shift;
+        if (( $# > 0 )); then echo -n ' '; fi
+    done
+)}
+
+function unescape_filename() { local s=$(args_or_input "$@"); echo -e "${s//%/\\x}"; }
+
+function readlink_as_rpath()
+{
+    local link=$1 file_type='';
+    file_type=$(stat $link -c%F)
+    if [ "$file_type" == 'symbolic link' ]; then
+        readlink $link | sed -r 's|^.*/(store/[^/]+/[^/]+)/?$|\1/|g'
+    elif [ "$file_type" == 'directory' ]; then
+        echo ${link%%/}/
+    else
+        log_error "File '$link' is not a symbolic link or directory."
+        return 1
+    fi
+}
+
+# Enumerate database directory names under 'data/'
+# Requires: DEFAULT_DIR
+function enumerate_database_directories()
+{(
+    set +e;
+    local regex='.*'; [ -z "$DB" ] || regex="$(escape_filename $DB)";
+    cd ${DEFAULT_DIR:-.}
+    find data/ -ignore_readdir_race -regextype posix-extended -maxdepth 1 -mindepth 1 -type d -regex ".*/$regex" -printf '%f\n'
+)}
+
+# Enumerate (link, real path) pairs in 'data/'
+# Requires: DEFAULT_DIR
+function enumerate_table_directories()
+{(
+    set +e;
+    local regex='.*'; [ -z "$TABLES" ] || regex="($(escape_filename $TABLES | tr ' ' '|'))";
+    cd ${DEFAULT_DIR:-.}
+    for db in $(enumerate_database_directories); do
+        if [ $(database_engine) == 'Atomic' ]; then
+            find data/$db -ignore_readdir_race -regextype posix-extended -maxdepth 1 -mindepth 1 -type l -regex ".*/$regex" -printf '%p %l\n'
+        else
+            find data/$db -ignore_readdir_race -regextype posix-extended -maxdepth 1 -mindepth 1 -type d -regex ".*/$regex" -printf '%p %p\n'
+        fi
+    done | sed -r 's|([^ ]+) .*/(store/[^/]+/[^/]+/)$|\1 \2|g'
+)}
+
+
+declare -gx REGEX_PART_NAME='[0-9a-fl]+_[0-9]+_[0-9]+_[0-9_]+' # e5c54dc3af3e0240ec334505af0121ce_374516_374919_9, all_1170084_1170084_0
+
+# Enumerate (link, partition ID, part path)
+# Requires: DISK_DIR, DEFAULT_DIR
+function enumerate_parts()
+{(
+    set +e;
+    if [ "$PARTITION_IDS" == 'NONE' ]; then return 0; fi
+    local partition_ids=${PARTITION_IDS//,/|} caller=${FUNCNAME[1]}
+    cd ${DISK_DIR:-.}
+    enumerate_table_directories | while read link rpath; do
+        if [ -d $rpath ]; then
+            log_trace "Enumerating parts in '$link ($rpath)' for caller function $caller"
+            if [ ! -d $rpath/detached ]; then
+                log_trace "Directory '$link ($rpath)' suspiciously does not contain subdirectory 'detached'."
+            fi
+            if [ -z "$partition_ids" ]; then
+                find $rpath -ignore_readdir_race -regextype posix-extended -maxdepth 1 -mindepth 1 -type d -regex ".*/$REGEX_PART_NAME$" -printf "${link//%/%%} %p\n"
+            else
+                find $rpath -ignore_readdir_race -regextype posix-extended -maxdepth 1 -mindepth 1 -type d -regex ".*/($partition_ids)_[0-9_]+$" -printf "${link//%/%%} %p\n"
+            fi
+        else
+            log_debug "Skipped non-existent directory '$link ($rpath)'."
+        fi
+    done | sed -r 's|^([^ ]+) (.+/([0-9a-fl]+)_[0-9_]+)$|\1 \3 \2|g'
+    # time seq 1 100000 | sed 's|.*|data/business/http_log store/2ae/2ae234234/&_&_&|g' | sed -r 's|^([^ ]+) (.+/([0-9a-fl]+)_[0-9_]+)$|\1 \3 \2|g' >/dev/null
+    # 1.492s
+    # time seq 1 100000 | sed 's|.*|data/business/http_log store/2ae/2ae234234/&_&_&|g' | while read link path; do partition_id=${path##*/}; partition_id=${partition_id%%_*}; echo $link $partition_id $path; done >/dev/null
+    # 7.667s
+) 2> >(with_suffix " (stack ${FUNCNAME[*]} from $$)" >&2)
+}
+
+# log_trace() { echo "$@" >&2; }; log_debug() { echo "$@" >&2; }; log_info() { echo "$@" >&2; }; log_warn() { echo "$@" >&2; }; log_error() { echo "$@" >&2; }
+
+# Requires: DISK_DIR, DEFAULT_DIR
+function spread_parts()
+{
+    local hosts=( $REMOTE_HOSTS ) jobs=${JOBS:-1}
+    local N=${#hosts[@]}
+    # Ideal batch_size =~ total_numer_of_parts / number_of_remote_hosts
+    local batch_size=${RSYNC_BATCH_SIZE:-500}
+    cd $DISK_DIR
+
+    local terminate_xargs_on_error='[ $? == 0 ] || exit 255'; [ "$RSYNC_STRICT" == true ] || terminate_xargs_on_error=':'
+    # time seq 100000 -1 1 | awk '{n=strtonum($0); print "data/db/table", int(n/10), "store/aeb/aeb53f/"n"_"n  }' > /dev/null
+    # 0.106s
+    # time seq 100000 -1 1 | awk '{n=strtonum($0); print "data/db/table", int(n/10), "store/aeb/aeb53f/"n"_"n  }' | while read _ partition_id path; do host=${hosts[$(( 0x${partition_id:0:15} % N))]}; dst="$SSH_USER@$host:$REMOTE_DIR"; echo $path/ $dst; done > /dev/null
+    # 6.45s
+    # time seq 100000 -1 1 | awk '{n=strtonum($0); print "data/db/table", int(n/10), "store/aeb/aeb53f/"n"_"n  }' | awk ...
+    # 0.346s
+    enumerate_parts | awk -v N=$N -v SSH_USER=$SSH_USER -v REMOTE_DIR=$REMOTE_DIR -v hosts_str="${hosts[*]}" -v max_batch_size=$batch_size -v ARG_MAX=$(getconf ARG_MAX) '
+        # Batch $batch_size parts into one line by partition ID.
+        # Input:
+        #   <link>   <partition ID>   <part path>
+        #   data/db/table 1 store/aeb/aeb53f/1_1_1
+        #   data/db/table 1 store/aeb/aeb53f/1_2_2
+        #   data/db/table 2 store/aeb/aeb53f/2_1_3
+        # Output:
+        #   <part path>...  <ssh_user@remote_host:/remote/directory>
+        #   store/aeb/aeb53f/1_1_1 store/aeb/aeb53f/1_2_2 $SSH_USER@host1:/remote/dir
+        #   store/aeb/aeb53f/2_1_3                        $SSH_USER@host2:/remote/dir
+        BEGIN {
+            split(hosts_str, hosts, " ");
+            batch_size = 10 * N;
+            batch_size = batch_size<=max_batch_size ? batch_size : max_batch_size;
+            ARG_MAX = ARG_MAX>1024*1024+1024 ? 1024*1024+1024 : ARG_MAX;
+        }
+        {
+            buf[NR % batch_size] = host_index_of($2) " " $0
+            count++; len+=length($0) + 1
+            if (count == batch_size || len >= ARG_MAX-1024)
+            {
+                process_batch()
+                delete buf; count=0; len=0
+                if (batch_size < max_batch_size) # We need a ramp-up.
+                    batch_size = batch_size*2 < max_batch_size ? batch_size*2 : max_batch_size
+            }
+        }
+        END { if (count > 0) process_batch() }
+
+        function process_batch()
+        {
+            asort(buf)
+            # for (i in buf) print "-- " buf[i];
+
+            split(buf[1],f,FS)
+            key=f[1]; run=f[4]
+            for (i = 2; i <= count; i++)
+            {
+                split(buf[i],f,FS); cur_key=f[1]
+                if (key == cur_key)
+                    run=run " " f[4]
+                else
+                {
+                    print compose(key, run)
+                    key=cur_key; run=f[4]
+                }
+            }
+            if (length(run) > 0)
+                print compose(key, run)
+            fflush()
+        }
+        function host_index_of(partition_id)
+        {
+            return (strtonum("0x"substr(partition_id, 1, 15)) % N) + 1
+        }
+        function compose(idx, run)
+        {
+            dst = SSH_USER "@" hosts[idx] ":" REMOTE_DIR
+            return run " " dst
+        }
+    ' | $XARGS -P$jobs -I{} bash -c "rsync_with_record -aR --partial --inplace --delete --force {}; $terminate_xargs_on_error"
+
+    with_stats_locked 'SENT=$SENT.' # Trailing dot for completion indication
+}
+
+# Requires: DISK_DIR, DEFAULT_DIR
+function calculate_total_file_size()
+{
+    set +e;
+    local delta=0 acc=0 batch_size=$GiB jobs=${JOBS:-1}
+    cd $DISK_DIR
+
+    set_stats_var TOTAL 0;
+    while read delta; do
+        ((acc+=delta, acc >= batch_size)) && {
+            # Retry locking on next iteration if it fails occasionally
+            if inc_stats_var_nonblocking TOTAL $acc; then acc=0; fi
+        }
+    done < <(
+        enumerate_parts | awk '{print$3}' | xargs -I_ find _ -type f -printf "%s\n" 2> >(with_suffix " (stack ${FUNCNAME[*]} from $$)" >&2) \
+        | awk "{acc+=\$1;count++} acc>$((batch_size/10))&&count>=10000 {print acc;acc=0;count=0;fflush()} END {print acc}"
+    )
+    inc_stats_var TOTAL $acc
+    with_stats_locked 'TOTAL=$TOTAL.' # Trailing dot for completion indication
+}
+
+function send_nondata()
+{
+    check_required_subdirectories $DEFAULT_DIR access metadata data user_defined || return 1
+    cd $DEFAULT_DIR
+
+    local terminate_xargs_on_error='[ $? == 0 ] || exit 255'; [ "$RSYNC_STRICT" == true ] || terminate_xargs_on_error=':'
+
+    local pids="" names=""
+    for host in $REMOTE_HOSTS; do
+        local dst=$SSH_USER@$host:$REMOTE_DIR
+
+        log_info "Sending subdirectories to $host: $(csv_quoted access metadata data user_defined)"
+        {
+            {
+                echo access user_defined
+
+                local -A metadatalink2rpath=()
+
+                # symlink 'metadata/<db>', file 'metadata/<db>.sql', dictionaries, views
+                while read -r db; do
+                    local metadatalink="metadata/$db"
+                    local metadata_rpath=$(readlink_as_rpath $metadatalink)
+                    metadatalink2rpath[$metadatalink]=$metadata_rpath
+                    echo "$metadatalink"
+                    echo "$metadatalink.sql"
+                    grep -l '^CREATE DICTIONARY' -r $metadata_rpath/ || :
+                    grep -Pl '^ATTACH (MATERIALIZED )?VIEW' -r $metadata_rpath/ || :
+                done < <(enumerate_database_directories)
+
+                local awk_vars=$(bash_map_variable_to_awk_repr metadatalink2rpath)
+
+                # symlink 'data/<db>/<table>', file 'store/.../.../<table>.sql'
+                enumerate_table_directories | awk '
+                    BEGIN { '"$awk_vars"' }
+                    {
+                        link=$1; split(link, f, "/")
+                        db=f[2]; table=f[3];
+                        metadatalink="metadata/" db
+                        print link
+                        print metadatalink2rpath[metadatalink] table ".sql"
+                    }'
+            } \
+            | awk -v batch_size=${RSYNC_BATCH_SIZE:-500} -v ARG_MAX=$(getconf ARG_MAX) '
+                    BEGIN { ARG_MAX = ARG_MAX>1024*1024+1024 ? 1024*1024+1024 : ARG_MAX; }
+                    {
+                        run=run" "$0; count++; len+=length($0);
+                        if (count>=batch_size || len>=ARG_MAX-1024)
+                        {
+                            print run;
+                            run=""; count=0; len=0
+                        }
+                    }
+                    END { if (run) print run }
+                ' \
+            | $XARGS -I{} bash -c "rsync -lptgoDdR --partial --inplace --delete --force {} $dst; $terminate_xargs_on_error" # rsync -a == rsync -rlptgoD
+
+            echo "cd $REMOTE_DIR; echo $DATABASE_ENGINE > database_engine.txt" | remote_bash $host
+        } &
+        pids+=" $!"; names+=" nondata-to-$host"
+    done
+    wait_pids_patiently 5 "$pids" "$names"
+}
+
+# On worker nodes
+function send_worker()
+{
+    set -e;
+    # Implicit variables DB,TABLES,PARTITION_IDS are not mandatory, yet affects behavior of enumerator functions.
+    check_variables_defined RSYNC_STATS_FILE DEFAULT_DIR DISK_DIR REMOTE_HOSTS REMOTE_DIR
+    # TODO also lock the $BASE_DIR on remote hosts.
+    lock_stats_100
+
+    check_required_subdirectories $DEFAULT_DIR .
+    check_required_subdirectories $DISK_DIR .
+
+    init_rsync_stats
+
+    local pid
+    calculate_total_file_size & pid=$!
+    log_debug "Spawned thread $pid for background calculation of total file size."
+
+    send_nondata
+
+    if [ $WORKER_MODE == p2p ]; then
+        log_info "Will send data parts to remote host: $REMOTE_HOSTS."
+        spread_parts
+        log_info "All data parts sent."
+    else
+        log_info "Will spread data parts to remote hosts: ${REMOTE_HOSTS// /,}."
+        spread_parts
+        log_info "All data parts spreaded out."
+    fi
+    wait $pid
+}
+
+function p2p_worker() { send_worker; }
+function spread_worker() { send_worker; }
+
+# Returns false if the distributed DDL queue is busy.
+function check_busy_distributed_ddl_queue()
+{(
+    set -e
+    local max_ddl_age=${1:-'0'}; # Max age of unfinished DDL entries to consider the queue as 'busy'
+    local result sql="SELECT entry,query_create_time,host,replaceRegexpAll(query,'(\n *)|( {2,})',' ') AS query
+        FROM system.distributed_ddl_queue
+        WHERE status!='Finished' AND (now() - query_create_time) >= $max_ddl_age
+        ORDER BY query_create_time ASC
+        LIMIT 10
+        FORMAT PrettyCompactMonoBlock"
+
+    log_info "Checking distributed DDL queue ..."
+    result=$(kube_chc_query "$sql")
+
+    if [ -n "$result" ]; then
+        log_debug "${NC}\n$result"
+        return 1;
+    fi
+    return 0;
+)}
+
+declare -gx \
+    CHEC_EXPECTED_END_OF_FILE=4 \
+    CHEC_NO_SUCH_COLUMN_IN_TABLE=16 \
+    CHEC_CANNOT_PARSE_INPUT_ASSERTION_FAILED=27 \
+    CHEC_BAD_ARGUMENTS=36 \
+    CHEC_LOGICAL_ERROR=49 \
+    CHEC_CANNOT_OPEN_FILE=76 \
+    CHEC_FILE_DOESNT_EXIST=107 \
+    CHEC_NO_FILE_IN_DATA_PART=226 \
+    CHEC_BAD_SIZE_OF_FILE_IN_DATA_PART=228 \
+    CHEC_STD_EXCEPTION=1001 \
+    CHEC_UNKNOWN_EXCEPTION=1002 \
+
+declare -Ax EXCEPTION_CODE_NAMES=(
+    [4]=EXPECTED_END_OF_FILE
+    [16]=NO_SUCH_COLUMN_IN_TABLE
+    [27]=CANNOT_PARSE_INPUT_ASSERTION_FAILED
+    [36]=BAD_ARGUMENTS
+    [49]=LOGICAL_ERROR
+    [76]=CANNOT_OPEN_FILE
+    [107]=FILE_DOESNT_EXIST
+    [226]=NO_FILE_IN_DATA_PART
+    [228]=BAD_SIZE_OF_FILE_IN_DATA_PART
+    [1001]=STD_EXCEPTION
+    [1002]=UNKNOWN_EXCEPTION
+)
+
+declare -gx UNRETRYABLE_EXCEPTION_CODES=(
+    $CHEC_EXPECTED_END_OF_FILE
+    $CHEC_NO_SUCH_COLUMN_IN_TABLE
+    $CHEC_CANNOT_PARSE_INPUT_ASSERTION_FAILED
+    $CHEC_BAD_ARGUMENTS
+    $CHEC_LOGICAL_ERROR
+    $CHEC_CANNOT_OPEN_FILE
+    $CHEC_FILE_DOESNT_EXIST
+    $CHEC_NO_FILE_IN_DATA_PART
+    $CHEC_BAD_SIZE_OF_FILE_IN_DATA_PART
+    $CHEC_STD_EXCEPTION
+    $CHEC_UNKNOWN_EXCEPTION
+)
+
+# ATTACH, DROP or REPLACE active with detached partitions
+function attach_or_drop_detached_partitions()
+{(
+    set +e;
+    local POD0=$1 action=${2^^} db=$3 table=$4 reason=$5 batch_size=100
+    local quoted_qualified_table="\`$db\`.\`$table\`"
+    local marker="$RST[$(get_color $POD0)$POD0$RST]"
+    set_chc_params true --alter_sync=2 --allow_drop_detached=1;
+
+    [[ "$action" =~ ^'ATTACH'|'DROP'|'REPLACE'$ ]] || {
+        log_error "Passed argument #2 should be one of 'ADD','DROP' or 'REPLACE', got: '$action'"
+        return 1
+    }
+    local cond_reason=''; (($# == 5)) && cond_reason="AND reason='$reason'" || :
+
+    while true; do
+        local tmp=$(mktmp)
+        (
+            local total partition_ids
+            total=$(kube_chc_query "SELECT count(DISTINCT partition_id) FROM system.detached_parts WHERE (database='$db' AND table='$table') $cond_reason")
+
+            if [ -z "$total" ]; then
+                log_error "Error retrieving number of detached parts from ClickHouse $POD0"
+                return 1
+            fi
+
+            log_info "$marker Found $total detached partitions in table $quoted_qualified_table."
+            if [ "$total" == '0' ]; then return 0; fi
+
+            local last_batch="" batch_repeat=0 # avoid dead loop
+            while true; do
+                partition_ids=$(kube_chc_query "SELECT DISTINCT partition_id FROM system.detached_parts WHERE (database='$db' AND table='$table') AND isNotNull(partition_id) $cond_reason ORDER BY partition_id LIMIT $batch_size")
+
+                [ $? == 0 ] || return 1
+                [ -z "$partition_ids" ] && {
+                    log_info "$marker Done with table $quoted_qualified_table.";
+                    break
+                }
+
+                local count=$(echo "$partition_ids" | wc -l)
+                local commands_template=$(echo "$partition_ids" | sed -e "s|^|__PLACEHOLDER__ PARTITION ID '|g; s|$|'|g" | tr '\n' ',' | sed -e 's|,$||');
+
+                if [ "$action" == ATTACH ]; then
+                    local commands_attach=${commands_template//__PLACEHOLDER__/ATTACH}
+                    # This is needed because ATTACH PARTITION leaves some inactive parts which may cause errors in future steps.
+                    local commands_drop_detached=${commands_template//__PLACEHOLDER__/DROP DETACHED}
+                    kube_chc_query "
+                        ALTER TABLE $quoted_qualified_table $commands_attach;
+                        ALTER TABLE $quoted_qualified_table $commands_drop_detached" -n --echo
+                elif [ "$action" == DROP ]; then
+                    local commands_drop_detached=${commands_template//__PLACEHOLDER__/DROP DETACHED}
+                    kube_chc_query "ALTER TABLE $quoted_qualified_table $commands_drop_detached" --echo
+                else # if REPLACE
+                    local commands_drop=${commands_template//__PLACEHOLDER__/DROP}
+                    local commands_attach=${commands_template//__PLACEHOLDER__/ATTACH}
+                    local commands_drop_detached=${commands_template//__PLACEHOLDER__/DROP DETACHED}
+                    kube_chc_query "
+                        ALTER TABLE $quoted_qualified_table $commands_drop;
+                        ALTER TABLE $quoted_qualified_table $commands_attach;
+                        ALTER TABLE $quoted_qualified_table $commands_drop_detached;" -n --echo
+                fi > >(log_prefix "$marker") # for messages from '--echo'
+
+                if [ "$RESTORE_BEST_EFFORT" == true ]; then continue; fi
+
+                if [[ " ${UNRETRYABLE_EXCEPTION_CODES[*]} " =~ " $EXCEPTION_CODE " ]]; then
+                    log_error "$marker Exception code $EXCEPTION_CODE is not retryable. Will not continue."
+                    return 1
+                fi
+
+                # if the same partition batch repeated
+                if [[ "$last_batch" == "$partition_ids" ]]; then
+                    (( ++batch_repeat >= 3 + count )) && {
+                        log_error "$marker Max repeat times for dropping same batch of partitions reached for table $quoted_qualified_table. Will not continue."
+                        return 1
+                    }
+                    sleep $((batch_repeat * 1))
+                else
+                    batch_repeat=0
+                fi
+                last_batch=$partition_ids
+            done
+        ) 2> >(tee $tmp >&2)
+        local ret=$?;
+        if [ $ret == 0 ]; then return 0; fi
+        # Retry on "i/o timeout" error
+        tmp=$(cat $tmp; rm -f $tmp)
+        if [[ "$tmp" =~ "Error from server: error dialing backend: dial tcp ".*" i/o timeout" ]]; then
+            log_info "Retrying on i/o timeout error"
+            continue
+        fi
+        return $ret
+    done
+)}
+
+function attach_or_drop_detached_partitions_for_tables()
+{
+    local pod=$1 action=$2 db=$3 tables=$4 reason=$5 jobs=${JOBS:-1}
+    (($# == 5)) && reason="'$reason'" || :
+    local repr_export_patch=$(bash_export_patch)
+    array_transpose $tables | xargs -P$jobs -I{} bash -c ": attach_or_drop_detached; $repr_export_patch; attach_or_drop_detached_partitions $pod $action $db {} $reason; [ \$? == 0 ] || exit 255"
+}
+
+function get_physical_tables_list()
+{
+    local condition="database='$DB' ${TABLES:+AND table IN ( $(csv_quoted $TABLES) )}"
+    kube_chc_query "SELECT DISTINCT table FROM system.tables WHERE $condition AND engine LIKE '%MergeTree'" --format TSVRaw
+}
+
+function freeze_partitions()
+{(
+    set -e
+    if [[ -n "$FREEZE_PARTITIONS_WITH_NAME" ]]; then
+        local backup_name=$FREEZE_PARTITIONS_WITH_NAME
+        for table in $(get_physical_tables_list); do
+            LOG_PREFIX=true kube_chc_query_all "
+                ALTER TABLE \`$DB\`.\`$table\` UNFREEZE WITH NAME '$backup_name';
+                ALTER TABLE \`$DB\`.\`$table\` FREEZE WITH NAME '$backup_name';
+            " -n --echo
+        done
+        log_info "Backup '$backup_name' created."
+    fi
+)}
+
+function unfreeze_partitions()
+{(
+    set -e
+    if [[ -n "$FREEZE_PARTITIONS_WITH_NAME" && "$UNFREEZE_PARTITIONS" == true ]]; then
+        local backup_name=$FREEZE_PARTITIONS_WITH_NAME
+        for table in $(get_physical_tables_list); do
+            LOG_PREFIX=true kube_chc_query_all "ALTER TABLE \`$DB\`.\`$table\` UNFREEZE WITH NAME '$backup_name';" --echo
+        done
+        log_info "Backup '$backup_name' released."
+    fi
+)}
+
+# On worker nodes
+function restore_access_worker()
+{
+    check_variables_defined RSYNC_STATS_FILE BASE_DIR DEFAULT_DIR || return 1
+    lock_stats_100 || return 1
+
+    if [ ! -d "$BASE_DIR" ]; then
+        log_error "Directory '$BASE_DIR' does not exist."
+        return 1
+    fi
+    cd $BASE_DIR
+
+    for dir in $(find . -maxdepth 1 -mindepth 1 -type d -printf '%P\n'); do
+        LOG_LEVEL=WARN check_required_subdirectories $BASE_DIR/$dir access || continue;
+        (
+            cd $BASE_DIR/$dir
+            local names=''
+            for f in quotas.list roles.list row_policies.list settings_profiles.list users.list; do
+                [ -f "access/$f" ] || names+="${names:+ }$f";
+            done
+            if [ -n "$names" ]; then
+                log_warn "Skipped directory '$BASE_DIR/$dir' that does not contain necessary access entity list files $(csv_quoted $names)"
+                exit # subshell
+            fi
+            rsync -aR --partial --inplace --delete --force access $DEFAULT_DIR
+            log_info "Replaced all access entities with that from directory '$BASE_DIR/$dir/access'"
+        )
+        break
+    done
+}
+
+# Checks that all tables from $SOURCE_DIR exist in target $DEFAULT_DIR
+# Also populates 'link2rpath', mapping from symbolic link in $SOURCE_DIR to relative path in target $DEFAULT_DIR
+# Requires: DEFAULT_DIR (of target instance)
+function get_map_of_link_2_target_rpath()
+{
+    check_variables_defined DEFAULT_DIR || return 1
+    var_defined link2rpath || { log_error "Variable $link2rpath undefined."; return 1; }
+
+    # local -n link2rpath_ref=$1 # incompatible with bash <4.3
+
+    while read link rpath; do
+        IFS=/ read _ p2 p3 <<<"$link"
+        read db table <<<"$(unescape_filename $p2 $p3)"
+        hint="";
+        if [ "data/$db/$table" != "$link" ]; then
+            hint=" (for table \`$db\`.\`$table\`)"
+        fi
+
+        # Translate database and table names
+        local link_mapped=$link
+        if [[ -n "${MAP2NEWDB_ESCAPED[$p2]}" || -n "${MAP2NEWTABLE_ESCAPED[$p3]}" ]]; then
+            local p2_mapped=$p2 p3_mapped=$p3
+            [ -z "${MAP2NEWDB_ESCAPED[$p2]}" ] || p2_mapped=${MAP2NEWDB_ESCAPED[$p2]}
+            [ -z "${MAP2NEWTABLE_ESCAPED[$p3]}" ] || p3_mapped=${MAP2NEWTABLE_ESCAPED[$p3]}
+            link_mapped="data/$p2_mapped/$p3_mapped"
+            if [ -n "$hint" ]; then
+                read db_mapped table_mapped <<<"$(unescape_filename $p2_mapped $p3_mapped)"
+                hint=" (for table \`$db\`.\`$table\` from '$BASE_DIR', mapped to \`$db_mapped\`.\`$table_mapped\`)"
+            fi
+            log_debug "Source link '$link' mapped to '$link_mapped'."
+        fi
+
+        if [ $DATABASE_ENGINE == 'Atomic' ]; then # Don't use $(database_engine)
+            if ! [ -L $DEFAULT_DIR/$link_mapped ]; then
+                log_error "Symbolic link file '$link_mapped'$hint does not exist in target directory '$DEFAULT_DIR'."
+                return 1
+            fi
+        else
+            if ! [ -d $DEFAULT_DIR/$link_mapped ]; then
+                log_error "Data directory '$link_mapped'$hint does not exist in target directory '$DEFAULT_DIR'."
+                return 1
+            fi
+        fi
+
+        link2rpath[$link_mapped]=$(cd $DEFAULT_DIR; readlink_as_rpath $link_mapped);
+        if [ -z "${link2rpath[$link_mapped]}" ]; then
+            log_error "Relative path '${link2rpath[$link_mapped]} ($link_mapped)'$hint does not exist in target directory '$DEFAULT_DIR'."
+            return 1
+        fi
+    done < <(DEFAULT_DIR=. DISK_DIR=. enumerate_table_directories)
+}
+
+# Requires: link2rpath, DISK_DIR
+function enumerate_detached_directories()
+{
+    var_defined link2rpath || { log_error "Variable $link2rpath undefined."; return 1; }
+    for target_rpath in ${link2rpath[@]}; do
+        local dir="$DISK_DIR/${target_rpath%/}/detached"
+        if [ -d "$dir" ]; then echo $dir; fi
+    done
+}
+
+function restore_worker()
+{(
+    set -e
+    check_variables_defined RSYNC_STATS_FILE SOURCE_DIR DEFAULT_DIR DISK_DIR || return 1
+    # Lock to avoid any concurrent restore commands.
+    lock_stats_100 || return 1
+
+    check_required_subdirectories $SOURCE_DIR .
+    check_required_subdirectories $DEFAULT_DIR data metadata
+    check_required_subdirectories $DISK_DIR store
+
+    local restore_command=${RESTORE_COMMAND:-'mv'}
+
+    if [ "$restore_command" == 'mv' ]; then
+        restore_command='mv --backup=numbered -f'
+        log_info "Will 'mv' data parts from directory '$SOURCE_DIR' to detached directory of corresponding tables in '$DISK_DIR'."
+    else
+        restore_command='rsync -a --partial --inplace --delete --force'
+        log_info "Will 'rsync' data parts from directory '$SOURCE_DIR' to detached directory of corresponding tables in '$DISK_DIR'."
+    fi
+    cd $SOURCE_DIR
+
+    local jobs=${JOBS:-1} batch_size=${RESTORE_BATCH_SIZE:-50}
+
+    local -A link2rpath
+    get_map_of_link_2_target_rpath
+
+    log_debug "$(declare -p link2rpath)"
+
+    local awk_vars="
+        $(bash_map_variable_to_awk_repr link2rpath)
+        $(bash_map_variable_to_awk_repr MAP2NEWDB_ESCAPED)
+        $(bash_map_variable_to_awk_repr MAP2NEWTABLE_ESCAPED)"
+
+    local awk_script='
+            BEGIN { '"$awk_vars"' }
+            {
+                link=$1; path=$3;
+                split(link, f, "/")
+                db=f[2]; table=f[3]
+
+                if (MAP2NEWDB_ESCAPED[db] || MAP2NEWTABLE_ESCAPED[table])
+                {
+                    if (MAP2NEWDB_ESCAPED[db]) db=MAP2NEWDB_ESCAPED[db]
+                    if (MAP2NEWTABLE_ESCAPED[table]) table=MAP2NEWTABLE_ESCAPED[table]
+                }
+                link="data/" db "/" table
+                print DISK_DIR "/" link2rpath[link] "detached/", path
+            }
+        '
+    if [[ ${#MAP2NEWDB_ESCAPED[@]} == 0 && ${#MAP2NEWTABLE_ESCAPED[@]} == 0 ]]; then
+        awk_script='
+            BEGIN { '"$awk_vars"' }
+            {
+                link=$1; path=$3;
+                print DISK_DIR "/" link2rpath[link] "detached/", path
+            }
+        '
+    fi
+
+    if [ "$CLEAR_EXISTING_DETACHED" == true ]; then
+        log_info "Removing existing detached data parts."
+        enumerate_detached_directories \
+        | xargs -I{} find {} -ignore_readdir_race -regextype posix-extended -maxdepth 1 -mindepth 1 -type d -regex ".*/$REGEX_PART_NAME$" \
+        | $XARGS -P$jobs -I{} command rm -rf {}
+    fi
+
+    # Move or copy data parts to detached/
+    DEFAULT_DIR=. DISK_DIR=. enumerate_parts \
+    | awk -v DISK_DIR=$DISK_DIR "$awk_script" \
+    | awk -v batch_size=$batch_size -v ARG_MAX=$(getconf ARG_MAX) '
+        # Input:    Output:
+        #   T1 S1     S1 S2 T1
+        #   T1 S2     S3 S4 T2
+        #   T2 S3     S5    T3
+        #   T2 S4
+        #   T3 S5
+        BEGIN { ARG_MAX = ARG_MAX>1024*1024+1024 ? 1024*1024+1024 : ARG_MAX; }
+        {
+            buf[NR % batch_size] = $0
+            count++; len+=length($0);
+            if (count>=batch_size || len>=ARG_MAX-1024)
+            {
+                process_batch()
+                delete buf; count=0; len=0
+            }
+        }
+        END { if (count > 0) process_batch() }
+
+        function process_batch()
+        {
+            asort(buf)
+            split(buf[1],f,FS); key=f[1]; run=f[2]
+            for (i = 2; i <= count; i++)
+            {
+                split(buf[i],f,FS); cur_key=f[1]
+                if (key == cur_key)
+                    run=run " " f[2]
+                else
+                {
+                    print compose(key, run)
+                    key=cur_key; run=f[2]
+                }
+            }
+            if (length(run) > 0)
+                print compose(key, run)
+        }
+        function compose(key, run)
+        {
+            return run " " key
+        }
+    ' \
+    | $XARGS -P$jobs -I_ sh -c "command $restore_command _ || exit 255"
+
+    local a_part=$(
+        enumerate_detached_directories \
+        | while read -r dir; do find $dir -ignore_readdir_race -regextype posix-extended -maxdepth 1 -mindepth 1 -type d -regex ".*/$REGEX_PART_NAME$"; done \
+        | head -1
+    )
+    [ -n "$a_part" ] || { log_info "No data part was restored from '$SOURCE_DIR'."; return 0; }
+
+    # Do chown if needed
+    local expected_uid_gid='' actual_uid_gid=''
+    if [ -n "$RESTORE_UID_GID" ]; then
+        expected_uid_gid=$RESTORE_UID_GID
+    else
+        expected_uid_gid=$(stat -c "%u:%g" $DEFAULT_DIR/data)
+        actual_uid_gid=$(stat -c "%u:%g" $a_part)
+        [ -n "$expected_uid_gid" ] || { log_error "Error retrieving file permisson of '$DEFAULT_DIR/data'."; return 1; }
+        [ -n "$actual_uid_gid" ] || { log_error "Error retrieving file permisson of restored data parts in detached."; return 1; }
+    fi
+
+    if [ "$actual_uid_gid" == "$expected_uid_gid" ]; then expected_uid_gid=''; fi
+
+    local repr_export_patch=$(bash_export_patch)
+    enumerate_detached_directories | xargs -P$jobs -I{} bash -c ": launder_data_parts; $repr_export_patch; launder_data_parts {} $expected_uid_gid"
+)}
+
+function format_readable_time_delta_compact()
+{
+    local sec=$1 zero_padding=$2
+    awk -v sec=$sec -v zero_padding=$zero_padding '
+        BEGIN {
+            f = zero_padding ? "%02d%s" : "%d%s"
+            d = int(sec / 86400); r = sec % 86400;
+            h = int(r / 3600); r %= 3600; m = int(r / 60); s = r % 60
+            s=sprintf("%s%s%s%s", component(d,"d"), component(h,"h"), component(m,"m"), component(s,"s"))
+            print s ? s : "0s"
+        }
+        function component(v,u){ return v>0 ? sprintf(f, v, u) : "" }
+    ' | sed -r 's|^(([0-9]+[dhms]){2}).*$|\1|' # preserve 2 parts for readability
+}
+
+function report_worker()
+{(
+    set -e
+    check_variables_defined RSYNC_STATS_FILE POD
+    [ -f $RSYNC_STATS_FILE ] || {
+        log_warn "Statistics file does not exist: '$RSYNC_STATS_FILE'."
+        return 1
+    }
+    read -r total sent inflight timestamp_start <<<"$(
+        # shellcheck disable=SC2094
+        {
+            if ! flock -w 60 -x 10; then
+                log_error "Timeout aquiring lock on file $RSYNC_STATS_FILE"
+                return 1
+            fi
+            source $RSYNC_STATS_FILE
+            # concat numbers from the array with '+', and evaluate the resulting expression
+            inflight=$(( $(IFS='+'; echo "${INFLIGHT[*]}") ))
+            echo $TOTAL $SENT $inflight $TIMESTAMP_START
+        } 10< $RSYNC_STATS_FILE
+    )"
+    if [[ -z "$total" || "$total" == '0' ]]; then
+        echo -e "$POD\t 0\t 0\t 0 (still summing)\t        N/A\t N/A"
+    elif [ "$total" == '0.' ]; then
+        echo -e "$POD\t 0\t 0\t 0 (no data)\t  100.00000\t N/A"
+    else
+        summing_hint=''; [ "${total: -1}" == '.' ] || summing_hint='.'
+        completion_hint=''; [ "${sent: -1}" != '.' ] || completion_hint='.'
+    
+        total=${total%.}; sent=${sent%.};
+        progress=$(awk "BEGIN {printf \"%10.5lf\", ($sent+$inflight)*100/$total}")
+
+        function grouped() { numfmt --from=none --to=none --format="%'f" $1; }
+        function iec() { numfmt --from=none --to=iec $1; }
+
+        total_grouped=$(grouped $total); sent_grouped=$(grouped $sent); inflight_grouped=$(grouped $inflight)
+        total_readable=$(iec $total); sent_readable=$(iec $sent); inflight_readable=$(iec $inflight)
+
+        eta_readable='N/A' elapsed=$(( $(timestamp) - timestamp_start ))
+        [ -n "$completion_hint" ] || eta_readable=$(
+            if [[ $progress =~ ^[0\.\ ]+$ ]]; then echo INF; exit; fi
+            eta_sec=$(awk "BEGIN {print int($elapsed / $progress * (100 - $progress))}")
+            format_readable_time_delta_compact $eta_sec true
+        )
+
+        [ -z "$summing_hint" ] || total_readable="$total_readable, still summing"
+        [ -z "$completion_hint" ] || sent_readable="$sent_readable, done"
+        echo -e "$POD\t $inflight_grouped ($inflight_readable)\t $sent_grouped ($sent_readable)\t $total_grouped ($total_readable)\t $progress\t $eta_readable"
+    fi
+)}
+
+# DDL query should be formated first
+function ddl_replace_zk_path()
+{
+    local zookeeper=$1 new_path=$2;
+    sed -r "s|^(ENGINE = Replicated.*MergeTree)\('([^']*)'|\1('${zookeeper:+$zookeeper:}$new_path'|";
+}
+
+function enumerate_create_database_queries()
+{
+    enumerate_database_directories | while read -r db; do
+        [ -z "${MAP2NEWDB_ESCAPED[$db]}" ] || db=${MAP2NEWDB_ESCAPED[$db]};
+        # We don't care about actual database engine. Atomic is the best
+        echo "CREATE DATABASE IF NOT EXISTS \`$(unescape_filename $db)\` ON CLUSTER '{cluster}';"
+    done
+}
+
+function collect_create_queries_worker()
+{
+    check_variables_defined BASE_DIR || return 1
+
+    if [ ! -d "$BASE_DIR" ]; then
+        log_error "Directory '$BASE_DIR' does not exist."
+        return 1
+    fi
+
+    # log_info "Enumerating CREATE queries in $BASE_DIR" # No stdout
+    cd $BASE_DIR;
+
+    if [ "$RESTORE_DDL" == true ]; then
+        local zookeepers=(''); [ -z "$ZOOKEEPERS" ] || zookeepers=( $ZOOKEEPERS )
+        local n_zookeepers=${#zookeepers[@]} zookeeper_idx=0
+
+        echo "--- BEGIN VARIABLE TABLES"
+        for dir in $(find . -maxdepth 1 -mindepth 1 -type d -printf '%P\n'); do
+            LOG_LEVEL=WARN check_required_subdirectories $BASE_DIR/$dir metadata || continue;
+            (
+                cd $dir
+                enumerate_create_database_queries
+                enumerate_table_directories | while read -r link _; do
+                    IFS=/ read _ p2 p3 <<<"$link"
+                    metadata_path="$(readlink_as_rpath metadata/$p2)/$p3.sql"
+                    [ -z "${MAP2NEWDB_ESCAPED[$p2]}" ] || p2=${MAP2NEWDB_ESCAPED[$p2]};
+                    [ -z "${MAP2NEWTABLE_ESCAPED[$p3]}" ] || p3=${MAP2NEWTABLE_ESCAPED[$p3]};
+                    db=$(unescape_filename $p2) table=$(unescape_filename $p3)
+
+                    local uuid=$(uuidgen) zookeeper=${zookeepers[$((zookeeper_idx++ % n_zookeepers))]}
+
+                    sed -r "1{s|^.+\$|CREATE TABLE IF NOT EXISTS \`$db\`.\`$table\` UUID '$uuid' ON CLUSTER '{cluster}'|}; \${s|\$|;|}" "$metadata_path" \
+                    | ddl_replace_zk_path "$zookeeper" "/clickhouse/tables/{shard}/{database}/{table}/${RESTORE_REPLICA_PATH_ID:-$uuid}"
+                done
+            )
+            break
+        done
+        echo "--- END VARIABLE TABLES"
+    fi
+
+    if [ "$RESTORE_DICTIONARIES" == true ]; then
+        echo "--- BEGIN VARIABLE DICTIONARIES"
+        for dir in $(find . -maxdepth 1 -mindepth 1 -type d -printf '%P\n'); do
+            LOG_LEVEL=WARN check_required_subdirectories $BASE_DIR/$dir metadata || continue;
+            (
+                cd $dir
+                enumerate_create_database_queries
+                enumerate_database_directories | while read -r db_escaped; do
+                    local db=$(unescape_filename $db_escaped)
+                    [ -z "${MAP2NEWDB_ESCAPED[$db]}" ] || db=${MAP2NEWDB_ESCAPED[$db]};
+                    metadata_rpath=$(readlink_as_rpath metadata/$db_escaped)
+                    for file in $(grep -l '^CREATE DICTIONARY' -r $metadata_rpath/); do
+                        local name=$(unescape_filename $(basename ${file%.sql}))
+                        sed -r "1{s|^.+\$|CREATE OR REPLACE DICTIONARY \`$db\`.\`$name\` ON CLUSTER '{cluster}'|}; \${s|\$|;|}" $file
+                    done
+                done
+            )
+            break
+        done
+        echo "--- END VARIABLE DICTIONARIES"
+    fi
+
+    if [ "$RESTORE_FUNCTIONS" == true ]; then
+        echo "--- BEGIN VARIABLE FUNCTIONS"
+        for dir in $(find . -maxdepth 1 -mindepth 1 -type d -printf '%P\n'); do
+            LOG_LEVEL=WARN check_required_subdirectories $BASE_DIR/$dir user_defined || continue;
+            (
+                cd $dir
+                find user_defined -maxdepth 1 -mindepth 1 -type f -name "*.sql" \
+                | xargs -I{} sed -r "s|CREATE FUNCTION ([^ ]+) (.+)\$|CREATE OR REPLACE FUNCTION \1 ON CLUSTER '{cluster}' \2|; \${s|\$|;|}" {}
+            )
+            break
+        done
+        echo "--- END VARIABLE FUNCTIONS"
+    fi
+
+    if [ "$RESTORE_VIEWS" == true ]; then
+        echo "--- BEGIN VARIABLE VIEWS"
+        for dir in $(find . -maxdepth 1 -mindepth 1 -type d -printf '%P\n'); do
+            LOG_LEVEL=WARN check_required_subdirectories $BASE_DIR/$dir metadata || continue;
+            (
+                cd $dir
+                enumerate_create_database_queries
+                enumerate_database_directories | while read -r db_escaped; do
+                    local db=$(unescape_filename $db_escaped)
+                    [ -z "${MAP2NEWDB_ESCAPED[$db]}" ] || db=${MAP2NEWDB_ESCAPED[$db]};
+                    metadata_rpath=$(readlink_as_rpath metadata/$db_escaped)
+                    for file in $(grep -Pl '^ATTACH (MATERIALIZED )?VIEW' -r $metadata_rpath/); do
+                        local name=$(unescape_filename $(basename ${file%.sql}))
+                        sed -r "
+                            1{
+                                s|^ATTACH VIEW .+\$|CREATE OR REPLACE VIEW \`$db\`.\`$name\` ON CLUSTER '{cluster}'|;
+                                s|^ATTACH MATERIALIZED VIEW .+\$|DROP VIEW IF EXISTS \`$db\`.\`$name\` ON CLUSTER '{cluster}';\nCREATE VIEW \`$db\`.\`$name\` ON CLUSTER '{cluster}'|;
+                            };
+                            \${s|\$|;|}
+                        " $file
+                    done
+                done
+            )
+            break
+        done
+        echo "--- END VARIABLE VIEWS"
+    fi
+}
+
+# Remove data parts in $1/ that are empty, containing zero sized metadata files (corrupted), or backups from 'mv --backup=numbered'.
+# Do chown if given $2=<UID>:<GID>.
+function launder_data_parts()
+{(
+    set -eo pipefail
+    local dir=$1 uid_gid=$2
+    check_variables_defined dir
+    check_required_subdirectories $dir .
+
+    log_info "Laundering data parts in '$dir'."
+
+    find $dir -maxdepth 1 -mindepth 1 -type d -empty \
+    | while read -r part_path; do
+        (set -x; rm -r $part_path) 2> >(with_suffix " # it's empty." >&2)
+    done
+
+    find $dir -regextype posix-extended -maxdepth 2 -mindepth 2 -type f -size 0 -regex '.*/(columns.txt|count.txt|primary.idx)' -printf '%f %h\n' \
+    | sort -k2 | uniq -f1 \
+    | while read -r file part_path; do
+        (set -x; rm -rf $part_path) 2> >(with_suffix " # for zero sized file '$file'." >&2)
+    done
+
+    find $dir -regextype posix-extended -maxdepth 1 -mindepth 1 -type d -regex '.*/.*\.~[0-9]+~' \
+    | $XARGS -I{} command rm -rf {}
+
+    if [ -n "$uid_gid" ]; then
+        (set -x; chown --preserve-root -R $uid_gid $dir)
+    fi
+)}
+
+
+# Enumerate detached/ directories in target instance of all tables found in $BASE_DIR, and apply launder_data_parts()
+function launder_detached_for_base_worker()
+{
+    set -eo pipefail
+    check_variables_defined RSYNC_STATS_FILE BASE_DIR DEFAULT_DIR DISK_DIR
+
+    check_required_subdirectories $BASE_DIR .
+    check_required_subdirectories $DEFAULT_DIR metadata
+    check_required_subdirectories $DISK_DIR store
+
+    # Lock to avoid concurrent launder_detached_for_base commands.
+    lock_stats_100
+
+    cd $BASE_DIR;
+
+    local uid_gid
+    uid_gid=$(stat -c "%u:%g" $DEFAULT_DIR/metadata)
+
+    local repr_export_patch=$(bash_export_patch)
+
+    for dir in $(find . -maxdepth 1 -mindepth 1 -type d -printf '%P\n'); do
+        local subdirectories_to_check='metadata data'
+        if [ $(cd $dir; database_engine) == 'Atomic' ]; then subdirectories_to_check='metadata data store'; fi
+
+        LOG_LEVEL=INFO check_required_subdirectories $dir $subdirectories_to_check || continue;
+        (
+            cd $dir
+            local -A link2rpath=()
+            get_map_of_link_2_target_rpath
+            enumerate_detached_directories
+        )
+    done | sort -u \
+    | xargs -P${JOBS:-1} -I{} bash -c ": launder_data_parts; $repr_export_patch; launder_data_parts {} $uid_gid; [ \$? == 0 ] || exit 255"
+}
+
+# Data parts restore procedure executed on master node
+function restore_node()
+{(
+    set -e
+    trap_kill_group
+    local pod=$1 node=$2 result=$3
+    local marker="$RST$(get_color $pod)$pod($node)$RST"
+
+    local directories=$(echo "$result" | awk '{print $1}' | sort -u)
+    local db=$(echo "$result" | awk '{print $2}' | sort -u)
+    local tables=$(echo "$result" | awk '{print $3}' | sort -u)
+
+    if [ -z "$tables" ]; then log_warn "$marker No tables to restore from '$BASE_DIR'"; return 0; fi
+
+    log_info "$marker Found $(plural "$directories" subdirectory subdirectories) in '$BASE_DIR'."
+
+    # If there're more than 1 subdirectory in $BASE_DIR, and user specified '--replace', we have to drop the existing partitions in table.
+    if [ $(wc -l <<<"$directories") -gt 1 ] && [ "$RESTORE_REPLACE" == true ]; then
+        log_error "$marker Cannot perform replace partition because there're data parts from more than 1 subdirectory. Maybe '--map-database', '--map-table' or '--drop' meets your need."
+        return 1
+    fi
+
+    set_chc_params true --send_logs_level=error
+    declare -gx RESTORE_BEST_EFFORT
+
+    local clear_existing_detached=false
+
+    # Make first loop iteration to cope with the existing detached parts.
+    [ "$WITH_EXISTING_DETACHED_PARTS" == 'ignore' ] || directories="~~WITH_EXISTING_DETACHED~~ $directories"
+
+    for dir in $directories; do
+        if [ "$dir" == '~~WITH_EXISTING_DETACHED~~' ]; then
+            # Existing detached parts may have incorrect permission set, which causes error if we are to attach them.
+            if [ "$WITH_EXISTING_DETACHED_PARTS" == 'attach' ]; then
+                call_remote_worker $node launder_detached_for_base "$(
+                    declare -g POD=$pod RSYNC_STATS_FILE=$TMPDIR/stats.$pod;
+                    declare -g DATABASE_ENGINE=${POD2DATABASE_ENGINE[$pod]};
+                    declare -g DEFAULT_DIR=${PODDISK2HOSTPATH[$pod-default]} DISK_DIR=${PODDISK2HOSTPATH[$pod-$CHOSEN_DISK]};
+                    variables_declaration ${common_variables[@]}
+                )"
+            fi
+        else
+            log_info "$marker Restoring data parts from subdirectory '$dir'"
+
+            call_remote_worker $node restore "$(
+                declare -g POD=$pod RSYNC_STATS_FILE=$TMPDIR/stats.$pod;
+                declare -g DATABASE_ENGINE=${POD2DATABASE_ENGINE[$pod]};
+                declare -g SOURCE_DIR=$BASE_DIR/$dir;
+                declare -g DEFAULT_DIR=${PODDISK2HOSTPATH[$pod-default]} DISK_DIR=${PODDISK2HOSTPATH[$pod-$CHOSEN_DISK]};
+                declare -g CLEAR_EXISTING_DETACHED=$clear_existing_detached
+                variables_declaration ${common_variables[@]} SOURCE_DIR TARGET_DIR RESTORE_COMMAND CLEAR_EXISTING_DETACHED
+            )"
+            clear_existing_detached=false
+        fi
+
+        while true; do
+            tables_to_do=$(POD0=$pod kube_chc_query "SELECT DISTINCT table FROM system.detached_parts WHERE database='$db' AND table IN ($(csv_quoted $tables))")
+            [ $? == 0 ] || {
+                log_warn "$marker Some error occured on retrieving name of tables containing detached data parts. Will retry."
+                sleep 3
+                continue
+            }
+            if [ "$dir" == '~~WITH_EXISTING_DETACHED~~' ]; then
+                if [ -n "$tables_to_do" ]; then
+                    log_info "$marker Found existing detached parts in $(plural "$tables_to_do" table tables) $(csv_quoted $tables_to_do)."
+                
+                    if [ "$WITH_EXISTING_DETACHED_PARTS" == 'clear' ]; then
+                        clear_existing_detached=true
+                    elif [ "$WITH_EXISTING_DETACHED_PARTS" == 'attach' ]; then
+                        attach_or_drop_detached_partitions_for_tables $pod ATTACH $db "$tables_to_do";
+                    else
+                        log_error "$marker Please re-run script and specify how to deal with them with option '--clear-detached' or '--attach-detached'."
+                        return 1
+                    fi
+                fi
+                break # break to continue outer loop
+            else
+                [ -n "$tables_to_do" ] || {
+                    log_info "$marker Done with subdirectory '$dir'."
+                    break
+                }
+                if [ "$RESTORE_REPLACE" == true ]; then
+                    attach_or_drop_detached_partitions_for_tables $pod REPLACE $db "$tables_to_do";
+                else
+                    attach_or_drop_detached_partitions_for_tables $pod ATTACH $db "$tables_to_do";
+                fi
+            fi 2> >(tee >(
+                [ "$RESTORE_BEST_EFFORT" == true ] || {
+                    # for i in $(seq 1 10); do echo -- $i; sleep 0.5; done > >(tee >(echo 123)) # This makes bash v4.2 exit abnormally
+                    # for i in $(seq 1 10); do echo -- $i; sleep 0.5; done > >(tee >(cat >/dev/null; echo 123))
+                    cat > /dev/null; exit 0;
+                }
+
+                declare marker="$RST$(get_color $pod)[$pod]$RST"
+
+                declare regex_detach_reason_prefixes="broken_|unexpected_|noquorum_|ignored_|broken-on-start_|clone_|attaching_|deleting_|tmp-fetch_|covered-by-broken_|merge-not-byte-identical_|mutate-not-byte-identica_|inactive_"
+                # declare regex_error_part_relative_path="store/[a-f0-9]+/[a-f0-9-]+/detached/($regex_detach_reason_prefixes)*$REGEX_PART_NAME"
+                declare regex_error_part_relative_path="(store|data)/[^/ ]+/[^/ ]+/detached/($regex_detach_reason_prefixes)*$REGEX_PART_NAME"
+                declare regex_error_part_full_path="/[^ ]+/$regex_error_part_relative_path"
+
+                while read -r l; do
+                    [[ "$l" =~ '<Error>' ]] || continue
+                    ec=$(grep_exception_code_no_anchor <<<"$l")
+
+                    if [ -n "$ec" ]; then
+                        if [[ "$l" =~ $regex_error_part_full_path ]]; then
+                            local path=${BASH_REMATCH[0]}; path=${path/deleting_/}; path=${path/attaching_/}
+                            log_info "Noticed error part with full path '$path'."
+                            echo "set -x; rm -rf $path " | $KUBECTL exec -i $pod -- bash
+                            continue
+                        fi
+
+                        ec_name=${EXCEPTION_CODE_NAMES[$ec]}
+                        if [[ $ec =~ ^$CHEC_EXPECTED_END_OF_FILE|$CHEC_BAD_SIZE_OF_FILE_IN_DATA_PART|$CHEC_FILE_DOESNT_EXIST|$CHEC_NO_FILE_IN_DATA_PART|$CHEC_NO_SUCH_COLUMN_IN_TABLE$ ]]; then
+                            # Checksum mismatch, file missing, permission error
+                            read db table part <<<$(sed -nr "s|^.*?[^0-9a-z]($REGEX_PART_NAME).+in query: ALTER TABLE \`?([^ \`]+)\`?\.\`?([^ \`]+)\`? .+$|\2 \3 \1|gp" <<<"$l")
+                            if [ -n "$part" ]; then
+                                log_info "Noticed error part '$part' from table $db.$table."
+                                db=$(escape_filename $db) table=$(escape_filename $table)
+                                echo "$(declare -f with_suffix; variables_declaration db table part DISK2PATH ec_name);" '
+                                    function remove() {( set -x; rm "$@"; )}
+                                    for path in ${DISK2PATH[@]}; do
+                                        target=$path/data/$db/$table/detached/$part
+                                        if [ -d $target ]; then
+                                            remove -rf $target 2> >(with_suffix " # for exception $ec_name" >&2)
+                                        fi
+                                    done
+                                ' | $KUBECTL exec -i $pod -- bash
+                            fi
+                        elif [[ $ec =~ ^$CHEC_LOGICAL_ERROR$ ]]; then
+                            # Parts intersection errors
+                            # "Part {} intersects previous part {}. It is a bug!",
+                            # "Part {} intersects previous part {}. "
+                            # "Part {} intersects next part {}. It is a bug!",
+                            # "Part {} intersects part {}. It is a bug or a result of manual intervention "
+                            read db table part1 part2 <<<$(
+                                sed -nr "s|^.+Part ($REGEX_PART_NAME) intersects.* part ($REGEX_PART_NAME).+in query: ALTER TABLE \`?([^ \`]+)\`?\.\`?([^ \`]+)\`? .+$|\3 \4 \1 \2|gp" <<<"$l"
+                            )
+                            if [ -n "$part2" ]; then
+                                log_info "Noticed parts intersecting error between '$part1' and '$part2'."
+                                db=$(escape_filename $db) table=$(escape_filename $table)
+                                # Compare number of rows, and delete the part with less rows
+                                echo "$(declare -f with_suffix; variables_declaration db table part1 part2 DISK2PATH);" '
+                                    function remove() {( set -x; rm "$@"; )}
+                                    function count_in_part()
+                                    {
+                                        local -n part=$1 count=$2 part_path=$3
+                                        for path in ${DISK2PATH[@]}; do
+                                            part_path=$path/data/$db/$table/detached/$part
+                                            if [ -d $part_path ]; then
+                                                count=$(cat $part_path/count.txt 2>/dev/null)
+                                                return
+                                            fi
+                                        done
+                                        part_path=''
+                                    }
+                                    count_in_part part1 count1 path1
+                                    count_in_part part2 count2 path2
+                                    [ -z "$path1" ] || { ((count1 > 0)) || { remove -rf $path1 2> >(with_suffix " # it is empty" >&2); exit 0; } }
+                                    [ -z "$path2" ] || { ((count2 > 0)) || { remove -rf $path2 2> >(with_suffix " # it is empty" >&2); exit 0; } }
+                                    [[ -n "$path1" && -n "$path2" ]] || {
+                                        echo "One of the intersecting parts does not exist: '\''$path1'\'','\''$path2'\''." >&2
+                                        exit 0;
+                                    }
+                                    if ((count1 < count2)); then
+                                        remove -rf $path1 2> >(with_suffix " # it has fewer rows ($count1) than the other part $part2($count2)" >&2)
+                                    else
+                                        remove -rf $path2 2> >(with_suffix " # it has equal or fewer rows ($count2) than the other part $part1($count1)" >&2)
+                                    fi
+                                ' | $KUBECTL exec -i $pod -- bash
+                            fi
+                        else
+                            log_warn "Cannot handle exception code $ec."
+                        fi
+                    fi
+                done 2> >(log_error_prefix "$marker")
+            ) | grep -Pv 'in (/usr/bin/clickhouse|\?)$' >&2) # error handling done
+        done # attached data parts from $dir
+    done # for dir in $directories
+)}
+
+# Enumerate (subdirectory name, database name, table name) from $BASE_DIR
+function gather_directories_and_table_names_in_base_worker()
+{
+    check_variables_defined BASE_DIR || return 1
+
+    check_required_subdirectories $BASE_DIR . || return 1
+
+    # log_info "Enumerating table names in $BASE_DIR" # No stdout
+    cd $BASE_DIR;
+
+    for dir in $(find . -maxdepth 1 -mindepth 1 -type d -printf '%P\n'); do
+        local subdirectories_to_check='metadata data'
+        if [ $(cd $dir; database_engine) == 'Atomic' ]; then subdirectories_to_check='metadata data store'; fi
+
+        LOG_LEVEL=INFO check_required_subdirectories $dir $subdirectories_to_check || continue;
+        (
+            cd $dir
+            enumerate_table_directories | while read -r link _; do
+                IFS=/ read _ p2 p3 <<<"$link"
+                [ -z "${MAP2NEWDB_ESCAPED[$p2]}" ] || p2=${MAP2NEWDB_ESCAPED[$p2]};
+                [ -z "${MAP2NEWTABLE_ESCAPED[$p3]}" ] || p3=${MAP2NEWTABLE_ESCAPED[$p3]};
+                echo "$dir $(unescape_filename $p2) $(unescape_filename $p3)"
+            done
+        )
+    done
+}
+
+# On master node
+# TODO reschedule on error
+function p2p()
+{
+    local local_pods=( ${PODS[@]} )
+    local remote_hosts=() given_remote_hosts=( $REMOTE_HOSTS )
+    local N M
+
+    while true; do
+        remote_hosts+=(${given_remote_hosts[@]})
+        N=${#local_pods[@]} M=${#remote_hosts[@]}
+        (( N - M < ${#given_remote_hosts[@]} )) && break || :;
+    done
+    # special case where N < M
+    if ((N < M)) && [ "$REDISTRIBUTE" == true ]; then
+        # The branching should have been done by caller. But it's much cleaner if written here.
+        log_info "Number of local pods is less than number of remote hosts. Nothing to do in 'p2p' mode given REDISTRIBUTE=true."
+        return 0
+    fi
+    if [ "$REDISTRIBUTE" != true ] && ((N > M)); then
+        # Not redistributing data, just pair extra local nodes with remote hosts in round-robin manner
+        remote_hosts+=(${given_remote_hosts[@]})
+        M=${#remote_hosts[@]}
+    fi
+
+    # Print peering result
+    local peering_result=$(
+        local i=0
+        for pod in ${local_pods[@]}; do
+            ((i < M)) || break;
+            is_pod_chosen $pod || { ((++i)); continue; }
+            echo "  $pod --> ${remote_hosts[$((i++))]}"
+        done
+    )
+    log_info "Peering:$RST\n$peering_result"
+
+    local pids='' names=''
+    local i=0
+    for pod in ${local_pods[@]}; do
+        ((i < M)) || break;
+
+        is_pod_chosen $pod || { ((++i)); continue; }
+
+        local node=${POD2NODE[$pod]} remote_host=${remote_hosts[$((i++))]}
+
+        call_remote_worker $node p2p "$(
+            declare -g POD=$pod RSYNC_STATS_FILE=$TMPDIR/stats.$pod;
+            declare -g DATABASE_ENGINE=${POD2DATABASE_ENGINE[$pod]};
+            declare -g DEFAULT_DIR=${PODDISK2HOSTPATH[$pod-default]};
+            declare -g DISK_DIR=${PODDISK2HOSTPATH[$pod-$CHOSEN_DISK]}${FREEZE_PARTITIONS_WITH_NAME:+"/shadow/$FREEZE_PARTITIONS_WITH_NAME"};
+            declare -g PARTITION_IDS=${POD2PARTITIONIDS[$pod]};
+            declare -g REMOTE_HOSTS=$remote_host REMOTE_DIR=$REMOTE_DIR/$pod;
+            variables_declaration ${common_variables[@]} RSYNC_STRICT
+        )" &
+        pids+=" $!"; names+=" p2p-wiring-$node"
+    done
+    wait_pids_patiently 5 "$pids" "$names"
+}
+
+# On master node
+function spread()
+{
+    if [ "$REDISTRIBUTE" != true ]; then log_info "Not redistributing data parts."; return 0; fi
+
+    local local_pods=( ${PODS[@]} )
+    local remote_hosts=( $REMOTE_HOSTS )
+
+    local N=${#local_pods[@]} M=${#remote_hosts[@]}
+
+    local R=$(( N % M ))
+    local remainder_pods=(${local_pods[@]: -R})
+
+    if (( R == 0 )); then
+        log_info "No remainder local nodes to spread data from.";
+        return 0;
+    fi
+
+    # Print peering result
+    local peering_result=$(
+        for pod in ${remainder_pods[@]}; do
+            is_pod_chosen $pod || continue
+            echo "  $pod --> ${REMOTE_HOSTS// /,}"
+        done
+    )
+    log_info "Redistributing:$RST\n$peering_result"
+
+    local pids='' names=''
+    for pod in ${remainder_pods[@]}; do
+        is_pod_chosen $pod || continue
+
+        local node=${POD2NODE[$pod]}
+
+        call_remote_worker $node spread "$(
+            declare -g POD=$pod RSYNC_STATS_FILE=$TMPDIR/stats.$pod;
+            declare -g DATABASE_ENGINE=${POD2DATABASE_ENGINE[$pod]};
+            declare -g DEFAULT_DIR=${PODDISK2HOSTPATH[$pod-default]};
+            declare -g DISK_DIR=${PODDISK2HOSTPATH[$pod-${CHOSEN_DISK:-default}]}${FREEZE_PARTITIONS_WITH_NAME:+"/shadow/$FREEZE_PARTITIONS_WITH_NAME"};
+            declare -g PARTITION_IDS=${POD2PARTITIONIDS[$pod]};
+            declare -g REMOTE_DIR=$REMOTE_DIR/$pod;
+            variables_declaration ${common_variables[@]} RSYNC_STRICT
+        )" &
+        pids+=" $!"; names+=" spread-wiring-$node"
+    done
+    wait_pids_patiently 5 "$pids" "$names"
+}
+
+# On master node
+function send()
+{(
+    set -e;
+    get_clickhouse_pods
+    detect_clickhouse_credentials
+    get_database_engine_of_pods
+    get_disks_and_hostpaths
+
+    if [ "$PATCH_RC" == true ]; then patch_bashrc_for_all_hosts; fi
+
+    if [ "$SKIP_CHECKS" != true ]; then
+        are_clickhouse_servers_ready;
+
+        local engines
+        engines=$(distinct_engines_of_database $DB)
+        [ -n "$engines" ] || {
+            log_error "Database '$DB' does not exist. Will not proceed."
+            return 1;
+        }
+        [[ "$engines" =~ ('Atomic'|'Ordinary'|',') ]] || {
+            log_error "Database '$DB' is not of Atomic or Ordinary engine. Will not proceed."
+            return 1;
+        }
+
+        if (( ${#CHOSEN_PODS[@]} > 1 )); then
+            check_consistency_of_objects_on_cluster
+        fi
+    fi
+
+    if [ -n "$PARTITION_CONDITION" ]; then
+        query_matching_partition_ids;
+    elif [ -n "$PARTITION_IDS" ]; then
+        for pod in ${PODS[@]}; do POD2PARTITIONIDS[$pod]=$PARTITION_IDS; done
+    fi
+
+    trap_kill_group
+
+    create_remote_dir
+
+    freeze_partitions
+
+    p2p
+    spread
+
+    log_info "All data parts sent."
+
+    unfreeze_partitions
+)}
+
+# On master node
+function restore()
+{(
+    set -e
+    if ! command -v uuidgen >/dev/null; then log_error "Command 'uuidgen' not found."; exit 1; fi
+
+    if [[ "$RESTORE_DATA" == false && "$RESTORE_DDL" != true && "$RESTORE_ACCESS" != true \
+        && "$RESTORE_FUNCTIONS" != true && "$RESTORE_DICTIONARIES" != true && "$RESTORE_VIEWS" != true ]]; then
+        log_error "Nothing to restore."
+        return 1
+    fi
+
+    local db=$DB; [ -z "${MAP2NEWDB[$db]}" ] || db=${MAP2NEWDB[$db]};
+
+    get_clickhouse_pods
+    detect_clickhouse_credentials
+    get_disks_and_hostpaths
+
+    if [ "$PATCH_RC" == true ]; then patch_bashrc_for_all_hosts; fi
+
+    if [ "$SKIP_CHECKS" != true ]; then
+        are_clickhouse_servers_ready
+
+        local engines
+        engines=$(distinct_engines_of_database "$db")
+        [[ -z "$engines" || "$engines" =~ ('Atomic'|'Ordinary'|',') ]] || {
+            log_error "Database '$db' is not of Atomic or Ordinary engine. Will not proceed."
+            return 1;
+        }
+    fi
+
+    trap_kill_group
+
+    log_info "Gathering subdirectories and table names from base directory '$BASE_DIR'."
+    local files='' nodes=''
+    for pod in ${CHOSEN_PODS[@]}; do
+        local node=${POD2NODE[$pod]}
+        if [[ " $nodes " =~ " $node " ]]; then continue; fi
+        nodes+=" $node"
+    
+        call_remote_worker $node gather_directories_and_table_names_in_base "$(
+            declare -g POD=$pod; variables_declaration ${common_variables[@]}
+        )" > $TMPDIR/gathered_tables.$node || : &
+
+        files+=" $TMPDIR/gathered_tables.$node"
+        pids+=" $!"; names+=" gather-tables-wiring-$node"
+    done
+    wait_pids_patiently 5 "$pids" "$names"
+
+    local result=$(cat $files)
+    local directories=$(echo "$result" | awk '{print $1}' | sort -u)
+    local db=$(echo "$result" | awk '{print $2}' | sort -u) # should be only one database
+    local tables=$(echo "$result" | awk '{print $3}' | sort -u)
+
+    if [ -z "$tables" ]; then log_warn "No tables to restore from '$BASE_DIR' for any nodes."; return 0; fi
+
+    log_debug "Found $(plural "$directories" subdirectory subdirectories) in '$BASE_DIR' in total: $(csv_quoted $directories)."
+
+    [ "$SKIP_CHECKS" == true ] || check_busy_distributed_ddl_queue
+
+    # Drop existing tables that are to be restored
+    if [ -n "$RESTORE_DROP_OR_TRUNCATE" ]; then
+        log_info "Will try to $RESTORE_DROP_OR_TRUNCATE tables directly and create the flag file 'force_drop_table' when needed to."
+        local tables_to_do drop_tables_commands
+        tables_to_do=$(kube_chc_query "SELECT DISTINCT table FROM clusterAllReplicas('{cluster}',system.tables) WHERE database='$db' and table IN ($(csv_quoted $tables))")
+        for table in $tables_to_do; do
+            drop_tables_commands[$table]="${RESTORE_DROP_OR_TRUNCATE^^} TABLE IF EXISTS \`$db\`.\`$table\` ON CLUSTER '{cluster}' SYNC;"
+        done
+        kube_chc_query "${drop_tables_commands[*]}" -n --echo --ignore-error || :;
+
+        if [ "$RESTORE_DROP_OR_TRUNCATE" == 'drop' ]; then
+            tables_to_do=$(kube_chc_query "SELECT DISTINCT table FROM clusterAllReplicas('{cluster}',system.tables) WHERE database='$db' and table IN ($(csv_quoted $tables))")
+        else
+            tables_to_do=$(kube_chc_query "SELECT DISTINCT table FROM clusterAllReplicas('{cluster}',system.tables) WHERE total_rows>0 AND database='$db' and table IN ($(csv_quoted $tables))")
+        fi
+        for table in $tables_to_do; do
+            array_transpose ${PODS[@]} | xargs -P$(nproc) -IPOD $KUBECTL exec POD -- touch /var/lib/clickhouse/flags/force_drop_table
+            kube_chc_query "${drop_tables_commands[$table]}" --echo;
+        done
+        array_transpose ${PODS[@]} | xargs -P$(nproc) -IPOD $KUBECTL exec POD -- rm -f /var/lib/clickhouse/flags/force_drop_table
+        
+        if [ "$RESTORE_DROP_OR_TRUNCATE" == 'drop' ]; then RESTORE_DDL=true; fi
+        RESTORE_REPLACE=false;
+    fi
+
+    if [[ "$RESTORE_DDL" == true || "$RESTORE_FUNCTIONS" == true || "$RESTORE_DICTIONARIES" == true || "$RESTORE_VIEWS" == true ]]; then
+        (
+            set -e
+            tmp=$(mktmp); rm_on_exit -f $tmp
+
+            local nodes=''
+            for pod in ${CHOSEN_PODS[@]}; do
+                local node=${POD2NODE[$pod]}
+                [[ " $nodes " =~ " $node " ]] && continue || :
+                nodes+=" $node"
+
+                log_info "Collecting CREATE TABLE|VIEW|FUNCTION|DICTIONARY queries from host $node."
+
+                call_remote_worker $node collect_create_queries "$(
+                    variables_declaration ${common_variables[@]} RESTORE_REPLICA_PATH_ID RESTORE_DDL RESTORE_FUNCTIONS RESTORE_DICTIONARIES RESTORE_VIEWS
+                )" > $tmp || :
+
+                # Found the first node that contains CREATE queries
+                if [ -n "$(grep -v '^--- ' $tmp)" ]; then log_info "Got some CREATE queries from $node:$BASE_DIR"; break; fi
+            done
+
+            if [ -z "$(grep -v '^--- ' $tmp)" ]; then
+                log_error "Did not find any CREATE queries in directory '$BASE_DIR' on all remote hosts.";
+                return 1;
+            fi
+            # Mind the order of types of objects
+            for type in 'DICTIONARIES' 'FUNCTIONS' 'VIEWS' 'TABLES'; do
+                local queries=$(read_variable "$type" $tmp)
+                [ -n "$queries" ] || continue
+                kube_chc_query "$queries" -n --echo
+                log_info "Done creating ${type,,}."
+            done
+        )
+        [ $? == 0 ] || return 1;
+    fi
+    # Databases should exist on cluster after DDL restore.
+    get_database_engine_of_pods $db
+
+    if [ "$RESTORE_ACCESS" == true ]; then
+        (
+            set -e
+            local pids='' names=''
+            for pod in ${PODS[@]}; do
+                is_pod_chosen $pod || continue;
+                local node=${POD2NODE[$pod]}
+
+                log_info "Will restore access entities for $pod running on $node."
+
+                call_remote_worker $node restore_access "$(
+                    declare -g POD=$pod RSYNC_STATS_FILE=$TMPDIR/stats.$pod;
+                    declare -g DEFAULT_DIR=${PODDISK2HOSTPATH[$pod-default]};
+                    variables_declaration ${common_variables[@]}
+                )" &
+                pids+=" $!"; names+=" restore-access-wiring-$node"
+            done
+            wait_pids_patiently 5 "$pids" "$names"
+
+            kube_chc_query "SYSTEM RELOAD USERS ON CLUSTER '{cluster}'" --echo
+            log_info "Done restoring access entities."
+        )
+        [ $? == 0 ] || return 1;
+    fi
+
+    log_info "Checking that all tables to restore exist on cluster."
+    local existing_tables
+    existing_tables=$(kube_chc_query "
+        WITH
+            ( SELECT count() FROM system.clusters WHERE cluster = getMacro('cluster') ) AS count_hosts,
+            count() AS count
+        SELECT table
+        FROM clusterAllReplicas('{cluster}', system.tables)
+        WHERE database='$db' AND table IN ($(csv_quoted $tables))
+        GROUP BY table
+        HAVING count == count_hosts
+        ORDER BY table
+    " | sort)
+    # variables_declaration existing_tables tables
+    if [ "$(echo $existing_tables)" != "$(echo $tables)" ]; then
+        local not_existing_tables=$(array_transpose $tables $existing_tables | sort | uniq -u)
+        if [ "$RESTORE_DDL" == true ]; then
+            log_error "Unexpected error: $(plural "$not_existing_tables" table tables) still not exist after CREATE: $(csv_quoted $not_existing_tables)"
+        else
+            log_error "$(plural "$not_existing_tables" 'required table does' 'required tables do') not exist: $(csv_quoted $not_existing_tables)"
+        fi
+        return 1
+    fi
+
+    # Restore data parts for each node
+    if [ "${RESTORE_DATA:-true}" == true ]; then
+        if (( ${#NODE2POD[@]} < ${#POD2NODE[@]} )); then
+            log_warn "Number of nodes is less than number of ClickHouse server PODs. Some of the PODs may not get restored with data parts."
+        fi
+
+        if [ "${RESTORE_COMMAND:-mv}" == 'mv' ]; then
+            log_info "Checking that 'mv' command does not copy data."
+            local pids='' names=''
+            for pod in ${CHOSEN_PODS[@]}; do
+                local node=${POD2NODE[$pod]}
+                (
+                    set +e
+                    declare source_dir=$BASE_DIR target_dir=${PODDISK2HOSTPATH[$pod-$CHOSEN_DISK]}
+                    echo "$(variables_declaration source_dir target_dir)"'
+                        function same_fs() { [ "$(stat -c %d "$1")" = "$(stat -c %d "$2")" ]; }
+                        same_fs "${source_dir}" "${target_dir}"
+                    ' | remote_bash $node
+                    [ $? == 0 ] || {
+                        log_info "File moving between '$source_dir' and '$target_dir' requires data copying on host '$node'."
+                        exit 1
+                    }
+                ) &
+                pids+=" $!"; names+=" restore-check-mv-$node"
+            done
+            wait_pids_patiently 1 "$pids" "$names" || {
+                log_warn "File moving between source directories and target directories requires data copying. Please consider '--command rsync'."
+            }
+            unset pids names
+        fi
+
+        local pids='' names=''
+        local -A node2pod=()
+
+        for pod in ${CHOSEN_PODS[@]}; do
+            local node=${POD2NODE[$pod]}
+
+            if [[ " ${!node2pod[*]} " =~ " $node " ]]; then
+                log_warn "Node $node is already taken by POD ${node2pod[$node]}. Will not restore data parts for $pod"
+                continue
+            fi
+            node2pod[$node]=$pod
+
+            restore_node $pod $node "$(cat $TMPDIR/gathered_tables.$node)" &
+            pids+=" $!"; names+=" restore-wiring-$node"
+        done
+        wait_pids_patiently 5 "$pids" "$names"
+        log_info "All data parts restored."
+    fi
+
+    [ "$SKIP_CHECKS" == true ] || check_consistency_of_objects_on_cluster $db
+
+    log_info "Done."
+
+    trap_restore_kill_group
+)}
+
+function report()
+{(
+    set -e;
+    trap_kill_group
+
+    get_clickhouse_pods;
+    if [ "$PATCH_RC" == true ]; then patch_bashrc_for_all_hosts; fi
+
+    local wd="$TMPDIR/reports"
+    mkdir -p $wd; rm_on_exit -rf $wd
+
+    local files=''
+    for pod in ${CHOSEN_PODS[@]}; do
+        local node=${POD2NODE[$pod]}
+
+        call_remote_worker $node report "$(
+            declare -g POD=$pod RSYNC_STATS_FILE=$TMPDIR/stats.$pod;
+            variables_declaration ${common_variables[@]}
+        )" > "$wd/$pod" || : &
+        pids+=" $!"; names+=" report-wiring-$node"
+        files+=" $wd/$pod"
+    done
+    wait_pids_patiently 2 "$pids" "$names"
+
+    {
+        echo -e "Pod\t Inflight\t Sent\t Total\t Progress %\t ETA"
+        echo -e "───\t ────────\t ────\t ─────\t ──────────\t ───"
+        cat $files
+    } | mktable | sed -r "s,(\([^\)]+\)|N/A),$FAINT\1$NC,g"
+
+    trap_restore_kill_group
+)}
+
+function relay()
+{(
+    set -e;
+    trap_kill_group
+    check_variables_defined BASE_DIR REMOTE_HOSTS
+
+    if [ ! -d "$BASE_DIR" ]; then
+        log_error "Directory '$BASE_DIR' does not exist."
+        return 1
+    fi
+
+    log_info "Sending data from local directory '$BASE_DIR' to remote $(plural "$REMOTE_HOSTS" host hosts): ${REMOTE_HOSTS// /,}"
+    cd $BASE_DIR;
+    
+    local remote_hosts=() given_remote_hosts=( $REMOTE_HOSTS )
+    local subdirectories=($(
+        for dir in $(find . -maxdepth 1 -mindepth 1 -type d -printf '%P\n'); do
+            LOG_LEVEL=WARN check_required_subdirectories $dir metadata data store || continue;
+            echo $dir
+        done
+    ))
+    local N M
+
+    local DO_P2P=true DO_SPREAD=true
+
+    while true; do
+        remote_hosts+=(${given_remote_hosts[@]})
+        N=${#subdirectories[@]} M=${#remote_hosts[@]}
+        (( N - M < ${#given_remote_hosts[@]} )) && break || :;
+    done
+    if ((N < M)) && [ "$REDISTRIBUTE" == true ]; then
+        log_info "Number of subdirectories is less than number of remote hosts. Nothing to do in 'p2p' mode given REDISTRIBUTE=true."
+        DO_P2P=false
+    fi
+    if ((N == M)); then
+        log_info "Excess subdirectories are paired with remote hosts in round-robin order without remainders, no subdirectories to spread data from.";
+        DO_SPREAD=false
+    fi
+    if [ "$REDISTRIBUTE" != true ] && ((N > M)); then
+        remote_hosts+=(${given_remote_hosts[@]})
+        M=${#remote_hosts[@]}
+    fi
+
+    local i=0
+    if [ $DO_P2P == true ]; then
+        for dir in ${subdirectories[@]:0:M}; do
+            local remote_host=${remote_hosts[$((i++))]}
+            (
+                cd $dir
+                declare -g RSYNC_STATS_FILE="$TMPDIR/stats.$dir" # subdirectories are named the same as PODs
+                declare -g SOURCE_DIR=$BASE_DIR/$dir
+                declare -g REMOTE_HOSTS=$remote_host
+
+                # Though "$RSYNC_STATS_FILE.lock" is the lock file used on source hosts, locking it here still makes some sense
+                if [ -f "$RSYNC_STATS_FILE.lock" ] && ! flock -xn "$RSYNC_STATS_FILE.lock" true; then
+                    log_warn "Skipped subdirectory '$dir'."
+                    exit 0
+                fi
+                send_worker
+            )
+        done
+    fi
+    if [ $DO_SPREAD == true ]; then
+        local R=$((N % M))
+        for dir in ${subdirectories[@]: -R}; do
+            (
+                cd $dir
+                declare -g RSYNC_STATS_FILE="$TMPDIR/stats.$dir"
+                declare -g SOURCE_DIR=$BASE_DIR/$dir
+
+                if [ -f "$RSYNC_STATS_FILE.lock" ] && ! flock -xn "$RSYNC_STATS_FILE.lock" true; then
+                    log_warn "Skipped subdirectory '$dir'."
+                    exit 0
+                fi
+                send_worker
+            )
+        done
+    fi
+
+    trap_restore_kill_group
+)}
+
+# Export all functions
+declare -fx $(compgen -A function | grep -wv -e p2p -e spread -e restore -e send -e report -e worker)
+
+# Common variables necessary for worker functions to execute on remote machines
+declare -a common_variables=(
+    POD
+    DB TABLES
+    PARTITION_IDS
+    DATABASE_ENGINE
+    MAP2NEWDB MAP2NEWTABLE MAP2NEWDB_ESCAPED MAP2NEWTABLE_ESCAPED
+    ZOOKEEPERS
+    REMOTE_HOSTS
+    DEFAULT_DIR DISK_DIR REMOTE_DIR BASE_DIR # BASE_DIR = alias of REMOTE_DIR
+    JOBS
+    RSYNC_BATCH_SIZE RESTORE_BATCH_SIZE
+    VERBOSE
+    CGROUP_NAME IO_BANDWIDTH
+    TASK_SIGNATURE
+    RSYNC_RSH
+    RSYNC_STATS_FILE RSYNC_STATS_BATCH_SIZE
+    SSH SSH_USER SSH_PORT
+    USE_INTERNAL_IP
+    XARGS
+    DRY_RUN LOG_LEVEL
+    repr_LOGGING repr_LOGGING_PATCH # As we can not read the $BASH_SOURCE in worker mode
+)
+
+# On worker nodes
+function worker()
+{
+    redefine_logger_for_host
+    init_tmpdir
+    local pid
+    exit_when_orphaned & pid=$!
+
+    if [ -n "$IO_BANDWIDTH" ]; then
+        create_and_enter_cgroup "${CGROUP_NAME}" $IO_BANDWIDTH || return
+    fi
+
+    if ! func_defined ${WORKER_MODE}_worker; then
+        log_error "Unknown worker mode '$WORKER_MODE'"
+        return 1
+    fi
+
+    local ret=0
+    ${WORKER_MODE}_worker 2> >(log_error_prefix); ret=$?
+
+    kill $pid
+    # sleep 0.1 # wait asynchronous stdout/stderr flush
+    return $ret
+}
+
+# Remote bash function call. Name it 'RBFC standard' :)
+if [ -n "$WORKER_MODE" ]; then
+    worker
+    exit $?
+fi
+
+declare -g NAMESPACE=''
+declare -- REPLICA_REGEX='0' SHARDS_REGEX='[0-9]+'
+declare -gx POD_REGEX='' POD_REGEX_FOR_REPLICA='' # Assigned later
+declare -gx KEEP_PLACEHOLDER_PODS=false
+
+declare -gx KUBECTL=${KUBECTL:-kubectl}
+
+declare -gx DB='' TABLES='' PARTITION_IDS=''
+declare -g PARTITION_CONDITION=''
+declare -gA POD2PARTITIONIDS=()
+declare -gA MAP2NEWDB=() MAP2NEWDB_ESCAPED=() MAP2NEWTABLE=() MAP2NEWTABLE_ESCAPED=()
+declare -gx ZOOKEEPERS='' # '' for default zookeeper
+declare -gx CHOSEN_DISK='default'
+
+declare -gx CLEAR_EXISTING_DETACHED_PARTS='' ATTACH_EXISTING_DETACHED_PARTS=''
+
+declare -gx REMOTE_HOSTS='' REMOTE_DIR=''
+declare -gx REMOTE_BASTION='' REMOTE_NAMESPACE=''
+declare -gx REMOTE_CLICKHOUSE_SERVER_POD_LABEL=''
+declare -- REMOTE_REPLICA_REGEX='0' REMOTE_SHARDS_REGEX='[0-9]+'
+
+declare -gx VERBOSE=''
+declare -gx CGROUP_NAME='' IO_BANDWIDTH=''
+
+declare -gx SSH="${SSH:-ssh} -oGSSAPIAuthentication=no -oStrictHostKeyChecking=no -oPasswordAuthentication=no"
+declare -gx SSH_USER SSH_PORT=${SSH_PORT:-22}
+declare -gx RSYNC_RSH=$SSH
+declare -gx XARGS="xargs --no-run-if-empty --process-slot-var=XARGS_SLOT"
+declare -gx RSYNC_STATS_BATCH_SIZE=''
+
+declare -gx TASK_SIGNATURE='' # Constant. Assigned after argument parsing on master node
+
+declare -g PROG_NAME=$(basename $BASH_SOURCE) # '$BASH_SOURCE' is empty in worker modes
+
+function usage()
+{
+    unindent "
+        Usage: $PROG_NAME <COMMAND> <MANDATORY_FLAG>... [FLAG]...
+
+            1) $PROG_NAME send -H <REMOTE_HOSTS> -u <SSH_USER> -d <DIRECTORY> --db <DATABASE> [--tables <TABLES>]  [FLAG]...
+            2) $PROG_NAME restore -u <SSH_USER> -d <DIRECTORY> --db <DATABASE> [--tables <TABLES>]  [FLAG]...
+            3) $PROG_NAME report -u <SSH_USER> -d <DIRECTORY>  [FLAG]...
+            4) $PROG_NAME relay -H <REMOTE_HOSTS> -u <SSH_USER> -d <DIRECTORY> [--remote-directory] --db <DATABASE> [--tables <TABLES>]  [FLAG]..."
+
+    local raw_content=$(sed -n '/^#>>> ARGUMENT BEGIN/,/^#>>> ARGUMENT END/p' $0)
+    {
+        echo "$raw_content" | sed -n '/^#>>> COMMAND ARGUMENT BEGIN/,/^#>>> COMMAND ARGUMENT END/p'
+        echo "$raw_content" | sed -n '/^#>>> FLAG ARGUMENT BEGIN/,/^#>>> FLAG ARGUMENT END/p';
+    } \
+    | sed -nr '
+            /^## ?/{ s|^## ?||; p }
+            /^ {8}(-*[a-zA-Z0-9\|_\-]+)\)/{ s| +#:|: #|; s|^ {4}||; p }
+            /^ {12,}#.+/{ p }
+            /^ {4}#/{ s|^ {4}# ?||g; p }
+        ' \
+    | awk -F'#' '{ h=$1; $1=""; printf("%-24s%s\n",h,$0) }'
+}
+
+function normalize_opts()
+{
+    local raw_opts=$(sed -n '/^#>>> ARGUMENT BEGIN/,/^#>>> ARGUMENT END/p' $0 \
+        | sed -nr '
+                /^ {8}(-+[a-zA-Z0-9\|_\-]+)\)/ {
+                    s| *\) *#:|:#|           # argument indicator #:
+                    s| *#.*$||; s|[ \)]||g   # remove comments, parentheses, whitespaces
+                    s/\|/\n/g                # substitute | with \n
+                    /:$/ { s|:?$|:|gm }      # populate the argument indicator :
+                    s|^-+||gm                # remove leading dash -
+                    p
+                }
+            '
+    )
+    local short_opts=$(echo "$raw_opts" | awk '/^.:?$/ {print$0}' | tr -d '\n')
+    local long_opts=$(echo "$raw_opts" | awk '/^[^:]{2,}:?$/ {print$0}' | tr '\n' ',' | sed 's/,$//')
+    getopt -n $PROG_NAME -o $short_opts -l $long_opts -- "$@"
+}
+opts=$(normalize_opts "$@") || exit 1
+eval "set -- $opts"
+
+expected_arg_type='COMMAND'
+
+while (( $# > 0 )); do
+#>>> ARGUMENT BEGIN
+    if [[ "$1" == '--' ]]; then shift; continue; fi
+    if [[ $expected_arg_type == 'FLAG' || "$1" =~ ^'-'.+ ]]; then
+        case $1 in
+# Indicator '#:' means the corresponding flag needs a value.
+#>>> FLAG ARGUMENT BEGIN
+## Common flags
+        --kubeconfig) #: Path of kubeconfig file.
+            [ -f "$2" ] || { log_error "File does not exit: '$2'."; exit 1; }
+            declare -gx KUBECONFIG=$2;
+            shift 2;;
+        --ns|--namespace) #: Kubernetes namespace where ClickHouse cluster lives. Auto detected by default.
+            NAMESPACE=$2;
+            declare -gx KUBECTL="$KUBECTL -n $2"
+            shift 2;;
+        --k8s-label) #: Kubernetes POD label of ClickHouse servers. Defaults to 'clickhouse.altinity.com/chi'.
+            CLICKHOUSE_SERVER_POD_LABEL=$2
+            shift 2;;
+        --internal-ip) # Use IP addresses of Kubernetes nodes as SSH hostnames. Otherwise DNS lookup entry should be
+            # setup for each node (usually the /etc/hosts).
+            USE_INTERNAL_IP=true; shift;;
+        --chc) #: A single string containing flags to pass to clickhouse-client. Value of a flag should be
+            # directly connected to the flag by equal sign '='. e.g. --chc "--echo -n --max_threads=4".
+            # Can be specified multiple times.
+            set_chc_params true $2; shift 2;;
+        -j|--jobs) #: How many concurrent jobs to run. Defaults to 1.
+            if ! [[ "$2" =~ ^[0-9]+$ ]]; then log_error "Expecting integer for '--jobs', got '$2'."; exit 1; fi
+            JOBS=$2; shift 2;;
+        -u|--user) #: Mandatory. SSH user name for connecting with remote hosts. SSH public key authentication
+            # should be setup for this user on all local and remote hosts.
+            SSH_USER=$2; shift 2;;
+        -p|--port) #: SSH port to connect to on the remote hosts. Defaults to 22.
+            SSH_PORT=$2; shift 2;;
+        -H|--hosts) #: List of comma separated remote hosts. Mandatory for 'send' and 'relay', unless
+            # auto-discovered via '--remote-bastion' or '--remote-namespace'.
+            REMOTE_HOSTS=${2//,/ }; shift 2;;
+        -d|--directory) #: Mandatory. The remote target directory path when provided to 'send' command. Or the
+            # source directory when provided to 'restore' command.
+            BASE_DIR=${2%%/}; REMOTE_DIR=$BASE_DIR;
+            shift 2;;
+        -r|--replica) #: Filter PODs belonging to replica N. Defaults to 0.
+            if ! [[ "$2" =~ ^[0-9]+$ ]]; then log_error "Expecting integer for '--replica', got '$2'."; exit 1; fi
+            REPLICA_REGEX="${2}"; shift 2;;
+        -s|--shards) #: Filter PODs belonging to these shards, specified as comma separated discrete ranges like
+            # "1,3-8,10".
+            if ! [[ "$2" =~ ^[0-9][0-9,-]*$ ]]; then log_error "Invalid value for '--shards': '$2'."; exit 1; fi
+            SHARDS_REGEX=$(parse_discrete_ranges "$2" | tr ' ' '|')
+            shift 2;;
+        -K|--keep-placeholder-pods)
+            # Keep ClickHouse server PODs excluded by '--shards' as placeholders. That is, keep them in
+            # place when peering local PODs with remote hosts, but does not actually copy data from them.
+            KEEP_PLACEHOLDER_PODS=true; shift;;
+        --db|--database) #: Mandatory. Filter data parts belonging to the database.
+            DB=$2; shift 2;;
+        --tables) #: Filter data parts belonging to the tables. Specified as list of names separated by comma.
+            TABLES=$(echo $(array_sorted ${2//,/ } | tr '\n' ' '));
+            shift 2;;
+        --disk) #: Select the disk to send data from or restore data into, if source/target ClickHouse
+            # instance has multiple disks configured under <storage_configuration>. The storage layout
+            # can be complex. For exmaple, the source ClickHouse may have 8 disks
+            # ('default','disk1','disk2',...'disk7') grouped into two volumes, while the target
+            # ClickHouse may have 4 disks ('default','extended1','extended2','extended3') grouped into a
+            # single volume. There is no automatic or reliable way to determine how these disks should be
+            # matched, user must explicitly specify a disk for each 'send'/'restore' command. Defaults to
+            # 'default'.
+            # Note: Do not send data parts from multiple disks into the same '--directory'!
+            CHOSEN_DISK=$2; shift 2;;
+        --skip-checks) # Skip the DDL queue check, skip consistency check of objects, covering access entities,
+            # functions, tables columns, table indexes, etc, before sending data to remote.
+            SKIP_CHECKS=true; shift;;
+        --patch-rc) # Patch bashrc file for all local and remote hosts. To avoid executing any bash
+            # initialization script for faster SSH connection.
+            PATCH_RC=true; shift;;
+        --dry) # Dry run. Not implemented.
+            DRY_RUN=true; shift;;
+        --no-cache) # No cache on Kubernetes API server responses.
+            NO_CACHE=true; shift;;
+        --cgroup) #: Cgroup name to limit IO bandwidth. Defaults to 'crc-shared'. Creating cgroup requires root
+            # privilege of the user given as '--user' on all local hosts.
+            CGROUP_NAME=$2; shift 2;;
+        --io) #: IO bandwidth in IEC format like '1G'. Defaults to unlimited.
+            IO_BANDWIDTH=$(numfmt --from=iec --to=none $2) || exit 1;
+            shift 2;;
+        -v|--verbose) # Verbose output. This is equivalent to '--verbose' plus '--log-level debug'.
+            VERBOSE=true; LOG_LEVEL=DEBUG; shift;;
+        -V|--very-verbose) # Very verbose output. This is equivalent to '--verbose' plus '--log-level trace'.
+            VERBOSE=true; LOG_LEVEL=TRACE; shift;;
+        --log-level) #: Logging level.
+            LOG_LEVEL=$2;
+            if [ -z "${LOG_LEVELS[$LOG_LEVEL]}" ]; then echo "Unknown log level $LOG_LEVEL, should be one of ${!LOG_LEVELS[*]}"; exit 1; fi
+            shift 2;;
+        -h|--help) # This help text.
+            usage; exit 0;;
+##
+## Remote hosts auto-discovery (alternatives to '--hosts'; apply to 'send' and 'relay')
+        -J|--remote-bastion) #: [<USER>@]<ADDRESS>[:PORT]
+            # SSH address of a bastion server with 'kubectl' access to the target Kubernetes cluster.
+            # When set, the target's ClickHouse node IPs are auto-discovered by piping a shell snippet to
+            # the bastion; '--hosts' is then populated implicitly and must NOT be given. Optional ':PORT'
+            # suffix specifies the SSH port (e.g. 'user@host:2222'). The filters '--remote-k8s-label',
+            # '--remote-shards' and '--remote-replica' refine what gets discovered.
+            REMOTE_BASTION=$2; shift 2;;
+        --remote-namespace|--ns2) #:
+            # Namespace where the target ClickHouse cluster lives.
+            #   * Without '--remote-bastion': discovery runs locally and assumes the target cluster is in
+            #       the same Kubernetes cluster as the source.
+            #   * With '--remote-bastion':    discovery runs on the bastion against the remote cluster;
+            #       if omitted, the bastion auto-detects the sole namespace that has matching PODs.
+            REMOTE_NAMESPACE=$2; shift 2;;
+        --remote-k8s-label) #: POD label selector used during remote-host discovery. Defaults to the value of
+            # '--k8s-label'.
+            REMOTE_CLICKHOUSE_SERVER_POD_LABEL=$2; shift 2;;
+        --remote-replica) #: Filter remote PODs by replica during discovery. Defaults to 0 (same as '--replica' for the
+            # source side).
+            if ! [[ "$2" =~ ^[0-9]+$ ]]; then log_error "Expecting integer for '--remote-replica', got '$2'."; exit 1; fi
+            REMOTE_REPLICA_REGEX=$2; shift 2;;
+        --remote-shards) #: Filter remote PODs by shard ranges during discovery; comma separated discrete ranges like
+            # "1,3-8,10". Defaults to all shards.
+            if ! [[ "$2" =~ ^[0-9][0-9,-]*$ ]]; then log_error "Invalid value for '--remote-shards': '$2'."; exit 1; fi
+            REMOTE_SHARDS_REGEX=$(parse_discrete_ranges "$2" | tr ' ' '|')
+            shift 2;;
+##
+## Flags for command 'send'
+        --freeze) #: Freeze the partitions with specified name before copying, and unfreeze it afterward.
+            FREEZE_PARTITIONS_WITH_NAME=$2; UNFREEZE_PARTITIONS=${UNFREEZE_PARTITIONS:-true}
+            shift 2;;
+        --no-unfreeze) # Do not unfreeze the partitions on finish.
+            UNFREEZE_PARTITIONS=false; shift;;
+        --partition_ids) #: Filter data parts by partition IDs.
+            PARTITION_IDS=$2; shift 2;;
+        --condition) #: Condition on system.parts to filter for partition IDs. Prefered over `--partition_ids`.
+            PARTITION_CONDITION=$2; shift 2;;
+        --redistribute)
+            # Each remote host is paired with a local ClickHouse server POD in sequential order. If there
+            # are more local nodes than remote hosts, the extra local PODs redistribute their data across
+            # all remote hosts based on the hash of the partition ID. This does not necessarily guarantee
+            # a balanced distribution.
+            # For example:
+            # Case 1) 3 local nodes L1,L2,L3 and 2 remote hosts R1,R2
+            #     L1 -> R1
+            #     L2 -> R2
+            #     L3 -> R1,R2
+            # Case 2) 5 local nodes L1-L5 and 2 remote hosts R1,R2
+            #     L1 -> R1
+            #     L2 -> R2
+            #     L3 -> R1
+            #     L4 -> R2
+            #     L5 -> R1,R2
+            # Case 3) 2 local nodes L1,L2 and 3 remote hosts R1,R2,R3
+            #     L1 -> R1,R2,R3
+            #     L2 -> R1,R2,R3
+            #
+            # If '--redistribute' is not requested, extra local nodes are paired with remote hosts in
+            # sequential round-robin order.
+            REDISTRIBUTE=true; shift;;
+        --rsync-strict) # Terminate the whole 'send' command on encountering any `rsync` error, except code 24 (partial
+            # transfer due to vanished source files).
+            RSYNC_STRICT=true; shift;;
+        --rsync-batch) #: How many data parts to batch in a single 'rsync' command. Defaults to 500.
+            if ! [[ "$2" =~ ^[0-9]+$ ]]; then log_error "Expecting integer for '--rsync-batch', got '$2'."; exit 1; fi
+            RSYNC_BATCH_SIZE=$2; shift 2;;
+        --rsync-stats-batch-bytes) #:
+            # Update progress information in stats file each time the cumulative size of sent files
+            # reaches the specified threshold (default: 100 MiB). For reference, recording progress
+            # information introduces about 60 seconds of overhead when sending 1 TiB of data files with
+            # the default threshold.
+            RSYNC_STATS_BATCH_SIZE=$(numfmt --from=iec --to=none $2) || exit 1;
+            shift 2;;
+##
+## Flags for command 'restore'
+        -c|--command) #: Command to use for restoring data parts. Possible alternatives are 'mv', 'rsync'. Defaults
+            # to 'mv'.
+            if ! [[ "$2" =~ ^'mv'|'rsync'$ ]]; then log_error "Expecting 'mv' or 'rsync' for '--command', got '$2'."; exit 1; fi
+            RESTORE_COMMAND=$2; shift 2;;
+        --map-db|--map-database) #:
+            # Given '--map-database old_name=new_name', restore data parts from database named 'old_name'
+            # to database named 'new_name'. The option can be specified multiple times or as comma
+            # separated pairs like 'old_name1=new_name1,old_name2=new_name2,...'.
+            if ! parse_variable_assignments MAP2NEWDB "$2"; then exit 1; fi
+            for k in ${!MAP2NEWDB[@]}; do read -r k v <<<"$(escape_filename $k ${MAP2NEWDB[$k]})"; MAP2NEWDB_ESCAPED[$k]=$v; done
+            shift 2;;
+        --map-table) #: Given '--map-table old_name=new_name', restore data parts from table named 'old_name' to
+            # table named 'new_name'. The option can be specified multiple times or as comma separated
+            # pairs like 'old_name1=new_name1,old_name2=new_name2,...'.
+            if ! parse_variable_assignments MAP2NEWTABLE "$2"; then exit 1; fi
+            for k in ${!MAP2NEWTABLE[@]}; do read -r k v <<<"$(escape_filename $k ${MAP2NEWTABLE[$k]})"; MAP2NEWTABLE_ESCAPED[$k]=$v; done
+            shift 2;;
+        --ignore-detached) # Ignore exsiting detached parts. Not recommended because it's prone to part intersection
+            # errors.
+            WITH_EXISTING_DETACHED_PARTS='ignore'; shift;;
+        --clear-detached) # Clear exsiting detached parts.
+            WITH_EXISTING_DETACHED_PARTS='clear'; shift;;
+        --attach-detached) # Attach exsiting detached parts.
+            WITH_EXISTING_DETACHED_PARTS='attach'; shift;;
+        --best-effort) # Restore data parts with best effort. When encountering:
+            #   1. parts intersection error, delete the part that has fewer rows;
+            #   2. missing files, checksum mismatches, or permission errors, delete the part;
+            # then retry the operation. (Workers may still timeout during retries while the master
+            # process performs rescue operations asynchronously.) Implies '--attach-detached'.
+            [[ -z "$WITH_EXISTING_DETACHED_PARTS" || "$WITH_EXISTING_DETACHED_PARTS" == 'attach' ]] \
+                || log_warn "Previous command line options '--***-detached' is overridden by '--best-effort'."
+            WITH_EXISTING_DETACHED_PARTS='attach';
+            RESTORE_BEST_EFFORT=true;
+            shift;;
+        --no-data) # Do not restore data parts.
+            RESTORE_DATA=false; shift;;
+        --chown) #: Perform `chown -R <uid>:<gid>` before ATTACH PARTITION. For example '--chown 101:101'. By
+            # default, it's auto decided by comparing permission bits of one random source data part with
+            # those of the target directory.
+            if ! [[ "$2" =~ ^[0-9]+':'[0-9]+$ ]]; then log_error "Expecting colon separated integers <uid>:<gid> for '--chown', got '$2'."; exit 1; fi
+            RESTORE_UID_GID=$2; shift 2;;
+        --truncate) # Truncate existing tables before restore.
+            RESTORE_DROP_OR_TRUNCATE=truncate; shift;;
+        --drop) # Drop existing tables before restore. This implies '--ddl'.
+            RESTORE_DROP_OR_TRUNCATE=drop; shift;;
+        --replace) # Replace partitions from detached. This is done with a 'DROP PARTITION' before 'ATTACH
+            # PARTITION'. Can not be used if there're more than one subdirectories in directory given by
+            # '--directory', which is the case where multiple PODs had sent their data parts into the
+            # directory. In other words, '--replace' conflicts with '--redistribute' in most cases.
+            # Consider '--map-database', '--map-table' or '--drop' as alternatives.
+            RESTORE_REPLACE=true; shift;;
+        --ddl) # Restore database and table definitions.
+            RESTORE_DDL=true; shift;;
+        --access) # Restore access entities. This replaces the whole set of existing users, roles, profiles,
+            # row policies, and grants.
+            RESTORE_ACCESS=true; shift;;
+        --functions) # Restore user defined SQL functions. This replaces existing functions with conflicting
+            # names if any.
+            RESTORE_FUNCTIONS=true; shift;;
+        --dictionaries) # Restore user defined SQL dictionaries. This replaces existing dictionaries with
+            # conflicting names if any.
+            RESTORE_DICTIONARIES=true; shift;;
+        --views) # Restore views and materialized views. This replaces existing views with conflicting names
+            # if any.
+            RESTORE_VIEWS=true; shift;;
+        --zookeepers) #: ZooKeeper cluster names provided in ClickHouse configuration files, to hold metadata of
+            # Replicated MergeTree tables. Separate list of names with comma.
+            ZOOKEEPERS=${2//,/ };
+            shift 2;;
+        --replica-id) #: A unique identifier for replica path of Replicated MergeTree tables. Defaults to the table
+            # UUID which is randomly generated. Used as zookeeper replica path of Replicated MergeTree
+            # engine '/clickhouse/tables/{shard}/{database}/{table}/<replica-id>'.
+            RESTORE_REPLICA_PATH_ID=$2; shift 2;;
+        --restore-batch) #: How many data parts to batch in a single 'mv' / 'rsync' command. Defaults to 50.
+            if ! [[ "$2" =~ ^[0-9]+$ ]]; then log_error "Expecting integer for '--restore-batch', got '$2'."; exit 1; fi
+            RESTORE_BATCH_SIZE=$2; shift 2;;
+##
+## Flags for command 'relay'
+        --remote-directory) #:
+            # The remote target directory path. Should be specified after '--directory'. Defaults to
+            # the same value as '--directory'.
+            REMOTE_DIR=${2%%/}; shift 2;;
+        *)
+            log_error "Unknown flag: '$1'.";
+            usage; exit 1;
+        esac;
+    # 
+    # Note
+    #   The flags '--map-database' and '--map-table' do not alter the meaning of '--database' and '--table'. The
+    #   latter are used when enumerating data parts from the source database directory, while the former are applied
+    #   when restoring data parts (enumerated from '--directory') into the target database directory. Therefore, a
+    #   subsequent 'restore' command must use the same '--database' and '--table' values, if specified, as those used
+    #   in the preceding 'send' command.
+#>>> FLAG ARGUMENT END
+#>>> COMMAND ARGUMENT BEGIN
+##
+## Commands
+    elif [ $expected_arg_type = 'COMMAND' ]; then
+        case $1 in
+        send) # Send data to the directory given as '--directory' on remote hosts.
+            ;;
+        restore) # Restore data parts from the directory given as '--directory'.
+            ;;
+        report) # Report progress of command 'send'.
+            ;;
+        relay) # Re-send data from the directory given as '--directory' to remote hosts.
+            # Unlike the others, this command runs for the directory only on local host.
+            ;;
+        *)
+            log_error "Unknown command '$1', expecting one of send|restore|report"
+            exit 1;
+            ;;
+        esac
+        COMMAND=$1
+        expected_arg_type='FLAG'
+        shift;
+    else
+        log_error "Logical Error: Unknown argument type <$expected_arg_type>.";
+        usage; exit 1;
+    fi
+#>>> COMMAND ARGUMENT END
+#>>> ARGUMENT END
+done
+
+# Incomplete arguments
+if [ $expected_arg_type != 'FLAG' ]; then log_error "Expecting argument of type <$expected_arg_type>."; usage; exit 1; fi
+
+if [ -n "$NAMESPACE" ]; then kubectl get ns "$NAMESPACE" >/dev/null || exit; fi
+if [ "$VERBOSE" == true ]; then XARGS="$XARGS --verbose"; fi
+
+declare -gx GET_PODS_HEADER=$GET_PODS_HEADER_WITH_NODE_NAME
+[ "$USE_INTERNAL_IP" != true ] || declare -gx GET_PODS_HEADER=$GET_PODS_HEADER_WITH_NODE_IP
+
+TASK_SIGNATURE=$({ echo "$SSH_USER $BASE_DIR"; } | sha1sum | cut -c 1-6)
+log_debug "Task signature $TASK_SIGNATURE"
+
+POD_REGEX="chi-.*-($SHARDS_REGEX)-($REPLICA_REGEX)-0"
+POD_REGEX_FOR_REPLICA="chi-.*-[0-9]+-($REPLICA_REGEX)-0"
+
+init_cache
+init_tmpdir
+
+set_chc_params true "--log_comment=raw-copier-task-$TASK_SIGNATURE"
+set_chc_params false --receive_timeout=36000 --lock_acquire_timeout=36000 --distributed_ddl_task_timeout=36000;
+
+# Sanity check: disallow to low IO limit per rsync process
+if (( JOBS > 0 && IO_BANDWIDTH > 0 && IO_BANDWIDTH / JOBS <= 10*1024*1024 )); then
+    log_error "Too low bandwidth per thread: IO_BANDWIDTH($IO_BANDWIDTH) / JOBS($JOBS) = $((IO_BANDWIDTH / JOBS)), should be at least 10MiB. Please decrease '--jobs' or increase '--io'."
+fi
+
+if [ "$COMMAND" == 'send' ]; then
+    if [ -z "$DB" ]; then log_error "Missing '--database'."; usage; exit 1; fi
+    if [ -z "$SSH_USER" ]; then log_error "Missing SSH user name '--user'."; usage; exit 1; fi
+    discover_remote_hosts || exit 1
+    if [ -z "$REMOTE_HOSTS" ]; then log_error "Missing '--hosts' (or '--remote-bastion'/'--remote-namespace')."; usage; exit 1; fi
+    if [ -z "$REMOTE_DIR" ]; then log_error "Missing '--directory'."; usage; exit 1; fi
+    send
+elif [ "$COMMAND" == 'restore' ]; then
+    if [ -z "$DB" ]; then log_error "Missing '--database'."; usage; exit 1; fi
+    if [ -z "$SSH_USER" ]; then log_error "Missing SSH user name '--user'."; usage; exit 1; fi
+    if [ -z "$BASE_DIR" ]; then log_error "Missing '--directory'."; usage; exit 1; fi
+    if [[ "$WITH_EXISTING_DETACHED_PARTS" == 'ignore' && "$RESTORE_BEST_EFFORT" == true ]]; then
+        log_error "Option '--best-effort' should not be used with '--ignore-detached'."
+        exit 1;
+    fi
+    restore
+elif [ "$COMMAND" == 'report' ]; then
+    if [ -z "$SSH_USER" ]; then log_error "Missing SSH user name '--user'."; usage; exit 1; fi
+    if [ -z "$BASE_DIR" ]; then log_error "Missing '--directory'."; usage; exit 1; fi
+    report
+elif [ "$COMMAND" == 'relay' ]; then
+    if [ -z "$BASE_DIR" ]; then log_error "Missing '--directory'."; usage; exit 1; fi
+    if [ -z "$SSH_USER" ]; then log_error "Missing SSH user name '--user'."; usage; exit 1; fi
+    discover_remote_hosts || exit 1
+    if [ -z "$REMOTE_HOSTS" ]; then log_error "Missing '--hosts' (or '--remote-bastion'/'--remote-namespace')."; usage; exit 1; fi
+    if [ -z "$REMOTE_DIR" ]; then log_error "Missing '--remote-directory'."; usage; exit 1; fi
+    relay
+fi

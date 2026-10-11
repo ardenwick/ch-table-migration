@@ -1,0 +1,56 @@
+<clickhouse>
+    <storage_configuration>
+        <!-- Disks declaration -->
+        <disks>
+            <!--
+                local disk.
+                a local disk with name 'default' is special. it's path must be specified in <clickhouse><path>
+            -->
+            <default>
+                <type>local</type>
+            </default>
+            <disk1>
+                <type>local</type>
+                <path>/tmp/clickhouse/disk1/</path>
+            </disk1>
+            <disk2>
+                <type>local</type>
+                <path>/tmp/clickhouse/disk2/</path>
+            </disk2>
+            <disk3>
+                <type>local</type>
+                <path>/tmp/clickhouse/disk3/</path>
+            </disk3>
+        </disks>
+
+        <!-- Reference disks and organize them as volumes -->
+        <policies>
+            <extended>
+                <!--
+                    The order of volume enumeration within a storage policy is *important*. Once a volume is overfilled,
+                    data are moved to the next one. The order of disk enumeration is *important* as well because data are
+                    stored on them in turns.
+                -->
+                <volumes>
+                    <default>
+                        <disk0>default</disk0>
+                    </default>
+                    <jbod1>
+                        <!-- disk name refering storage_configuration.disks.<NAME>, e.g. "default" -->
+                        <disk0>disk1</disk0>
+                        <disk1>disk2</disk1>
+                        <!-- only JBOD -->
+                        <raid_type>JBOD</raid_type>
+                        <!-- round_robin or least_used -->
+                        <load_balancing>round_robin</load_balancing>
+                    </jbod1>
+                </volumes>
+                <!--
+                    when the amount of available space gets lower than this factor, data automatically starts to move on
+                    the next volume if any. defaults to 0.1
+                -->
+                <move_factor>0.1</move_factor>
+            </extended>
+        </policies>
+    </storage_configuration>
+</clickhouse>

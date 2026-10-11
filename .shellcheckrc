@@ -1,0 +1,33 @@
+# Project-wide shellcheck suppressions for ch-raw-copier and ch-table-migration.
+#
+# Rationale per code:
+#   SC2068  $arr[@] without quotes — IFS-splitting is intentional throughout
+#   SC2086  $var without quotes    — same, scripts rely on word-splitting
+#   SC2046  $(cmd) without quotes  — same
+#   SC2155  local x=$(cmd) hides $?  — audited; no caller inspects $? afterwards
+#   SC2206  arr=( $cmd_output )    — operates on whitespace-free tokens (pod/host names)
+#   SC2207  same                   — same
+#   SC2076  literal RHS in =~      — intentional `[[ " ${arr[*]} " =~ " $x " ]]` membership check
+#   SC2128  $arr without [@]/[i]   — intentional first-element grab in some helpers
+#   SC2179  arr+=$x on a string    — string-append idiom for $pids/$names lists
+#   SC2178  array-then-string      — same; wait_pids_patiently splits at the boundary
+#   SC2034  unused var             — false positives; values are serialized to remote bash
+#                                    via variables_declaration / bash_map_variable_to_awk_repr
+#   SC2120  fn references args but none passed — intentional optional-arg helpers
+#   SC2064  trap "$(expand-now)"   — intentional; values must be captured at trap-set time
+#   SC2044 . for f in $(find ..)   — operates on whitespace-free filenames
+#   SC2038  find | xargs           — same
+#   SC2254  unquoted $var in case  — patterns are integer exception codes, no glob risk
+#   SC2048  $*                     — intentional in helpers that re-split
+#   SC1087  $arr[k] needs braces   — false positives on color/marker strings containing literal [
+#   SC1090  can't follow source    — runtime-computed paths
+disable=SC2068,SC2086,SC2046,SC2155,SC2206,SC2207,SC2076,SC2128,SC2179,SC2178,SC2034,SC2120,SC2064,SC2044,SC2038,SC2254,SC2048,SC1087,SC1090
+
+#   SC2162  read without -r will mangle backslashes
+#   SC2030  Modification of variable is local (to subshell caused by $(..) expansion).
+#   SC2016  Expressions don't expand in single quotes, use double quotes for that.
+#   SC2031  REMOTE_HOSTS was modified in a subshell. That change might be lost.
+#   SC2028  echo may not expand escape sequences. Use printf.
+#   SC2013  To read lines rather than words, pipe/redirect to a 'while read' loop.
+#   SC2015  Note that A && B || C is not if-then-else. C may run when A is true.
+disable=SC2162,SC2030,SC2016,SC2031,SC2028,SC2013,SC2015

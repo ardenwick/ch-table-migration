@@ -1,0 +1,3257 @@
+#!/bin/bash
+
+declare PROG_NAME=$(basename $BASH_SOURCE)
+
+# Logging facility
+export NORMAL=$'\e[0m' BOLD=$'\e[1m' FAINT=$'\e[2m' ITALIC=$'\e[3m' UNDERLINE=$'\e[4m' REVERSED=$'\e[7m'
+export RED=$'\e[31m' GREEN=$'\e[32m' YELLOW=$'\e[33m' BLUE=$'\e[34m' MAGENTA=$'\e[35m' CYAN=$'\e[36m' WHITE=$'\e[37m' 
+export BG_RED=$'\e[41m' BG_GREEN=$'\e[42m' BG_YELLOW=$'\e[43m' BG_BLUE=$'\e[44m' BG_MAGENTA=$'\e[45m' BG_CYAN=$'\e[46m' BG_WHITE=$'\e[47m'
+export NC=$'\e[0m' RST=$'\e[0m'
+
+export LOG_FD_STDOUT=11 LOG_FD_STDERR=12
+eval "exec $LOG_FD_STDOUT>&1 $LOG_FD_STDERR>&2"
+
+# level name ==> level priority number
+declare -A LOG_LEVELS=( [TRACE]=1 [DEBUG]=10 [INFO]=20 [NOTIFY]=25 [WARN]=30 [ERROR]=40 [FATAL]=50 )
+# level name ==> color escape sequence
+declare -A LOG_COLORS=( [TRACE]="$FAINT$WHITE" [DEBUG]="$FAINT$GREEN" [INFO]="$BOLD$WHITE" [NOTIFY]="$UNDERLINE$BOLD$YELLOW" [WARN]="$BOLD$YELLOW" [ERROR]="$BOLD$RED" [FATAL]="$REVERSED$RED" )
+
+declare -u LOG_LEVEL=${LOG_LEVEL:-INFO}
+
+function LOG()
+{
+    local MYPID=${MYPID:-$BASHPID}
+    local levelName=$1; shift; local s="$*"
+    [[ ${LOG_LEVELS[$levelName]} ]] || return 0
+    (( ${LOG_LEVELS[$levelName]} < ${LOG_LEVELS[$LOG_LEVEL]} )) && return 0
+
+    local time=$(date +'%F %T.%3N') color=${LOG_COLORS[$levelName]}
+    echo -e "$MAGENTA$time$NC <$MAGENTA$MYPID$NC> [${color}${levelName}$NC] ${color}${s}$NC"
+}
+
+function log_trace(){ local MYPID=$BASHPID; ( set +x; LOG TRACE "$@" >&$LOG_FD_STDOUT ); }
+function log_debug(){ local MYPID=$BASHPID; ( set +x; LOG DEBUG "$@" >&$LOG_FD_STDOUT ); }
+function log_info(){ local MYPID=$BASHPID; ( set +x; LOG INFO "$@" >&$LOG_FD_STDOUT ); }
+function log_notify(){ local MYPID=$BASHPID; ( set +x; LOG NOTIFY "$@" >&$LOG_FD_STDOUT ); }
+function log_warn(){ local MYPID=$BASHPID; ( set +x; LOG WARN "$@" >&$LOG_FD_STDERR ); }
+function log_warning(){ local MYPID=$BASHPID; ( set +x; LOG WARN "$@" >&$LOG_FD_STDERR ); }
+function log_error(){ local MYPID=$BASHPID; ( set +x; LOG ERROR "$@" >&$LOG_FD_STDERR ); }
+function log_fatal(){ local MYPID=$BASHPID; ( set +x; LOG FATAL "$@" >&$LOG_FD_STDERR ); }
+
+function get_state_indication()
+{
+    if [ "$REVERT" == 'Initialize' ]; then
+        echo "$STATE(R)";
+    elif [ -n "$REVERT" ]; then
+        echo "$STATE(r)";
+    elif [ "$DIRTY" == true ]; then
+        echo "$STATE*";
+    else
+        echo "$STATE";
+    fi
+}
+
+function log_state_trace(){ local MYPID=$BASHPID; ( set +x; LOG TRACE "[$(get_state_indication)]" "$@" >&$LOG_FD_STDOUT ); }
+function log_state_debug(){ local MYPID=$BASHPID; ( set +x; LOG DEBUG "[$(get_state_indication)]" "$@" >&$LOG_FD_STDOUT ); }
+function log_state_info(){ local MYPID=$BASHPID; ( set +x; LOG INFO "[$(get_state_indication)]" "$@" >&$LOG_FD_STDOUT ); }
+function log_state_notify(){ local MYPID=$BASHPID; ( set +x; LOG NOTIFY "[$(get_state_indication)]" "$@" >&$LOG_FD_STDOUT ); }
+function log_state_warn(){ local MYPID=$BASHPID; ( set +x; LOG WARN "[$(get_state_indication)]" "$@" >&$LOG_FD_STDERR ); }
+function log_state_warning(){ local MYPID=$BASHPID; ( set +x; LOG WARN "[$(get_state_indication)]" "$@" >&$LOG_FD_STDERR ); }
+function log_state_error(){ local MYPID=$BASHPID; ( set +x; LOG ERROR "[$(get_state_indication)]" "$@" >&$LOG_FD_STDERR ); }
+function log_state_fatal(){ local MYPID=$BASHPID; ( set +x; LOG FATAL "[$(get_state_indication)]" "$@" >&$LOG_FD_STDERR ); }
+
+function log_prefix() { local prefix=$1; awk "{ printf \"${MAGENTA}%s${NC} $prefix %s\n\",strftime(\"%F %T\"),\$0 }"; }
+function log_error_prefix() { local prefix=$1; awk "{ printf \"${MAGENTA}%s${NC} $prefix %s\n\",strftime(\"%F %T\"),\$0; fflush() }" >&2; }
+
+function redefine_error_loggers_with_dir()
+{
+    if ! [ -d "$DIR" ]; then return 1; fi
+
+    function log_error(){ local MYPID=$BASHPID; ( set +x; LOG ERROR "$@" | last_error >&$LOG_FD_STDERR ); }
+    function log_fatal(){ local MYPID=$BASHPID; ( set +x; LOG FATAL "$@" | last_error >&$LOG_FD_STDERR ); }
+    function log_state_error(){ local MYPID=$BASHPID; ( set +x; LOG ERROR "[$(get_state_indication)]" "$@" | last_error >&$LOG_FD_STDERR ); }
+    function log_state_fatal(){ local MYPID=$BASHPID; ( set +x; LOG FATAL "[$(get_state_indication)]" "$@" | last_error >&$LOG_FD_STDERR ); }
+    function log_error_prefix() { local prefix=$1; awk "{ printf \"${MAGENTA}%s${NC} $prefix %s\n\",strftime(\"%F %T\"),\$0; fflush() }" | last_error >&2; }
+}
+
+function timestamp() { date +%s; }
+function timestamp_ms() { date +%s%3N; }
+function datetime() { date +'%F %T'; }
+function datetime_ms() { date +'%F %T.%3N'; }
+function mktmp() { local file=$(mktemp /tmp/chtm_XXXXXX); echo $file; log_trace "Temporary file $file acquired by ${FUNCNAME[1]}"; }
+
+function get_color()
+{
+    local text="$*"; [ -z "$text" ] && text=$(cat);
+    local hash=$(( 0x$(echo "$text" | sha256sum | cut -c 1-8) ))
+
+    # Make a random RGB color that has constant brightness.
+    # https://en.wikipedia.org/wiki/YCbCr
+
+    # Note that this is darker than the middle relative luminance, see "Gamma_correction" and "Luma_(video)".
+    # It still looks awesome.
+    local y=128;
+
+    local cb=$((hash % 256));
+    local cr=$((hash / 256 % 256));
+
+    local r=$(( (y*1000 + 1402 * (cr - 128)) / 1000 )); r=$(( r <= 255 ? r : 255 )); r=$(( r > 0 ? r : 0 ));
+    local g=$(( (y*1000 - 344 * (cb - 128) - 714 * (cr - 128)) / 1000 )); g=$(( g <= 255 ? g : 255 )); g=$(( g > 0 ? g : 0 ));
+    local b=$(( (y*1000 + 1772 * (cb - 128)) / 1000 )); b=$(( b <= 255 ? b : 255 )); b=$(( b > 0 ? b : 0 ));
+
+    # ANSI escape sequence to set 24-bit foreground font color in terminal.
+    echo $'\033'"[38;2;${r};${g};${b}m";
+    # echo -e "text=$text\t y=$y\t cb=$cb\t cr=$cr\t r=$r\t g=$g\t b=$b" >&2
+}
+
+# Spaces in arguments are not supported
+function rm_on_exit()
+{
+    if [ $$ == $BASHPID ]; then
+        log_error "Function rm_on_exit should be invoked from within a subshell."
+        return 1;
+    fi
+    if [ -n "$(trap -p EXIT)" ]; then
+        log_error "Signal EXIT is already trapped."
+        return 1;
+    fi
+    trap "rm $*" EXIT;
+}
+
+declare -g SIGNAL_QUEUE_FILE=ch-table-migration.$BASHPID.sig
+
+declare -A BACKUP_SIGNAL_ACTIONS=()
+
+function disable_signals() { for sig; do BACKUP_SIGNAL_ACTIONS[$sig]=$(trap -p $sig); trap "echo $sig >> $SIGNAL_QUEUE_FILE; log_info 'Received signal $sig'" $sig; done; }
+function restore_signals() { for sig; do eval "${BACKUP_SIGNAL_ACTIONS[$sig]:-"trap - $sig"}"; unset "BACKUP_SIGNAL_ACTIONS[$sig]"; done; }
+
+function trap_kill_group(){
+    local terminate=${1:-'false'} code=${2:-'1'};
+    trap "trap - SIGINT SIGTERM EXIT; [ -n \"\$(jobs -p)\" ] && kill -s SIGTERM \$(jobs -p) 2>/dev/null; [ $terminate == true ] && kill -s SIGTERM -- -$$" SIGINT SIGTERM EXIT;
+}
+function trap_restore_kill_group(){ trap - SIGINT SIGTERM EXIT; }
+
+function wait_pids_patiently()
+{
+    local initial_interval=$1 pids=( $2 ) names=( $3 ) regex_pattern="${4:-.*}"
+    local N=${#pids[@]} ret=0
+
+    if [ $N == 0 ]; then return; fi
+    if [ $N -gt 1 ]; then
+        log_debug "Will wait for $N pids ${pids[*]}, each named ${names[*]}"
+    else
+        log_debug "Will wait for pid ${pids[*]} named ${names[*]}"
+    fi
+
+    local interval=$initial_interval last=$(timestamp_ms) last_remaining=""
+    while true; do
+        sleep 0.2
+        local i=0 remaining=""
+        while (( i < N )); do
+            local pid=${pids[i]}
+            if [ -e /proc/$pid ] && grep -Pqe "$regex_pattern" /proc/$pid/cmdline 2>/dev/null; then
+                remaining+="${names[i]}($pid) ";
+            else
+                if ! wait $pid; then ret=1; fi
+            fi
+            ((++i));
+        done
+        if [ -z "$remaining" ]; then break; fi
+
+        if (($(timestamp_ms) - last > interval * 1000)); then
+            log_debug "Still waiting for $(echo $remaining | wc -w) PIDs: $remaining";
+            if [ "$remaining" == "$last_remaining" ]; then
+                ((interval+=3));
+            else
+                ((interval=initial_interval));
+            fi
+            last=$(timestamp_ms) last_remaining=$remaining
+        fi
+    done
+    return $ret
+}
+
+# Query exception code
+declare EXCEPTION_CODE=0
+
+function grep_exception_code() { sed -nr 's|^Code: ([0-9]+)\. DB::.+|\1|p; s|^std::exception. Code: ([0-9]+)[^0-9].+|\1|p'; }
+
+# Space characters in arguments are not supported.
+function kube_ch()
+{
+    local pod=$1 cmd=$2 query=$3; shift 3
+    local cmd_str="$KUBECTL exec -i $pod -- $cmd $* --query $query"
+    if [ -n "$DRY_RUN" ]; then log_trace "Executing (dry run): $cmd_str"; return 0; else log_trace "Executing: $cmd_str"; fi
+
+    EXCEPTION_CODE=0
+
+    local pod_color=$(get_color $pod)
+    local stderr_file=$(mktmp)
+    local exit_code_file=$(mktmp)
+
+    (
+        set +e -o pipefail;
+        $KUBECTL exec -i $pod -- bash -c "f=\$(mktemp);while [ -f \$f ];do sleep 0.02;((++i % 1000 == 0))&&echo -n ~@~@~@~HEARTBEAT~@~@~@~;done& $cmd $*;r=\$?;rm -f \$f 2>/dev/null;wait;exit \$r" 2>$stderr_file <<<"$query" | sed 's/~@~@~@~HEARTBEAT~@~@~@~//g';
+        echo $? > $exit_code_file
+    )
+
+    local ret=$(cat $exit_code_file)
+    if [ $ret != 0 ]; then
+        EXCEPTION_CODE=$(cat $stderr_file | tee >(log_prefix "[$pod_color$pod$RST]" >&2) | grep_exception_code | head -1)
+    elif [ $(stat -c %s $stderr_file) != 0 ]; then
+        ret=1;
+        log_error "Uncaught error with zero exit code but non-empty stderr content:\n$(cat $stderr_file)"
+    fi
+    log_debug "Exception code: $EXCEPTION_CODE, return: $ret."
+    rm -f $stderr_file $exit_code_file
+    return $ret
+}
+
+function kube_chf_query() { kube_ch $POD0 clickhouse-format "$@" --max_query_size=10240000; }
+
+function kube_chc_query() { kube_ch $POD0 clickhouse-client "$@" "${CHC_FLAGS[@]}"; }
+
+function kube_chc_query_all()
+{
+    local query=$1; shift
+    local cmd_str="clickhouse-client ${CHC_FLAGS[*]} $* --query $query"
+    if [ -n "$DRY_RUN" ]; then log_trace "Executing (dry run) in all PODs: $cmd_str"; return 0; else log_trace "Executing in all PODs: $cmd_str"; fi
+
+    EXCEPTION_CODE=0
+
+    local -A stderr_files=()
+    local -a pids=()
+
+    trap_kill_group;
+    for pod in ${SERVER_PODS[@]}; do
+        stderr_files[$pod]=$(mktmp)
+        if [ ${LOG_PREFIX:-false} == true ]; then
+            local pod_color=$(get_color $pod)
+            $KUBECTL exec -i $pod -- clickhouse-client "${CHC_FLAGS[@]}" "$@" 2>${stderr_files[$pod]} <<<"$query" | log_prefix "[$pod_color$pod$RST]" &
+        else
+            $KUBECTL exec -i $pod -- clickhouse-client "${CHC_FLAGS[@]}" "$@" 2>${stderr_files[$pod]} <<<"$query" &
+        fi
+        pids+=" $!"
+    done
+    wait_pids_patiently 10 "$pids" "${SERVER_PODS[*]}" # Don't return from here, or stderr_files are left behind.
+    trap_restore_kill_group;
+
+    # Messy error outputs
+    local stderr_size=0
+    for f in ${stderr_files[@]}; do stderr_size=$((stderr_size + $(stat -c %s $f) )); done
+
+    if (( stderr_size > 0 )); then
+        for pod in ${!stderr_files[@]}; do
+            local pod_color=$(get_color $pod)
+            local exception_code=$(cat ${stderr_files[$pod]} | tee >(log_error_prefix "[$pod_color$pod$RST]") | grep_exception_code | head -1)
+            if ((EXCEPTION_CODE == 0 && exception_code != 0)); then EXCEPTION_CODE=$exception_code; fi
+        done
+    fi
+    rm -rf ${stderr_files[*]};
+    if [ $EXCEPTION_CODE != 0 ]; then
+        log_debug "Exception code: $EXCEPTION_CODE, return 1"
+        return 1
+    fi
+}
+
+function index_line(){ local i=$1 text=$2; echo "$text" | tail -n+$i | head -1; }
+
+## Task Directory
+#
+# $ tree <TASK_DIR>/
+# ├── config                   # Configuration file.
+# ├── state                    # The state file, please don't touch it.
+# ├── state.override           # Similar to state file, generated by task management commands like 'pause','resume','set'.
+# ├── last_error               # Most recent error messages. Visible in output of 'report' command.
+# ├── consistency_report       # Created in state ConsistencyReport.
+# ├── dt.<POD>.sql             # State file of MigrateData.
+# ├── dt.<POD>.sql.state       # State file of MigrateData.
+# ├── move.<POD>.sql           # State file of MovePartitions.
+# ├── move.<POD>.sql.state     # State file of MovePartitions.
+# └── <NEW_DDL_REFERENCE>.sql  # The CREATE TABLE query of new table.
+
+declare DIR='' RELATIVE_DIR=''
+
+declare -a state_variables=(
+    states PROCEDURE           # Internal state.
+    ## Execution state.        # Internal state.
+    STATE DIRTY PAUSED REVERT  # Internal state.
+    STATES_START_TIME STATES_FINISH_TIME # Internal state.
+    ## From 'config'
+    CLUSTER DATABASE
+    LOCAL_TABLE       # Name of the table to migrate
+    DISTRIBUTED_TABLE # Name of distributed table
+    DISTRIBUTED_TABLE_SHARDING_KEY # Defaults to 'rand()'
+    NEW_DDL_REFERENCE # Path to file that contains `CREATE TABLE` query of new table structure.
+                      # Table name and the zookeeper path of replicated engines will be substituted with some other values.
+    EXPANDED_CLUSTER # Internal state. Expanded {macro} of '$CLUSTER'.
+    ## About command line
+    KUBECTL # Can be set to like 'KUBECTL="kubectl --kubeconfig=/path/to/alternative/kube.conf"'
+    SERVER_PODS POD0 CHC_FLAGS      # Internal state
+    ## Table structural variables.  # Internal state
+    LOCAL_TABLE_CHAMELEON   # Internal state
+    LOCAL_TABLE_DT          # Internal state
+    LOCAL_TABLE_MERGED      # Internal state
+    UUID_CHAMELEON  # Internal state
+    UUID_DT         # Internal state
+    ZOOKEEPER       # ZooKeeper cluster name
+    ENGINE_REPLICATED    # Internal state
+    ENGINE_DEDUPLICATING # Internal state
+    DDL_TEMPLATE             # Internal state. Populated from file $NEW_DDL_REFERENCE
+    DDL_ON_CLUSTER_CHAMELEON # Internal state. Populated from $DDL_TEMPLATE'
+    DDL_ON_CLUSTER_DT        # Internal state. Populated from $DDL_TEMPLATE
+    DDL_ON_CLUSTER_MERGE_CHAMELEON    # Internal state
+    DDL_ON_CLUSTER_MERGE_DT           # Internal state
+    DDL_ON_CLUSTER_DISTRIBUTED        # Internal state
+    DDL_ON_CLUSTER_DISTRIBUTED_MERGED # Internal state
+    ## Configuration variables from 'config' or 'state.override'
+    REPLICATED_MUTATION_THREADS # Mutation threads for Replicated.*MergeTree. Defaults to 2.
+    REPLICATED_ALL_REPLICAS     # For replicated tables, should we do the data copying on all replicas ?
+                                # Setting it to 'true' may result in 2-fold duplicated data. Defaults to 'false'.
+    ## State specific
+    STATE_Rearrange_THRESHOLD    # Minimum rows to arrange the full procedure. Defaults to 1000000.
+    STATE_Pause_ForLazy_BACKUP_DIR  # Directory to backup the task directory. Defaults to parent directory of the task directory.
+    STATE_DropProjectionsAndIndexes_DISTRIBUTED_DDL_TASK_TIMEOUT  # Value of setting 'distributed_ddl_task_timeout' on `ALTER TABLE DROP INDEX/PROJECTION`
+    STATE_SwapTables_COMPARE_DDL_INCLUDING_SETTINGS  # Should we consider 'SETTINGS' section while comparing table structures ? Defaults to 'false'.
+    STATE_SwapTables_COMPARE_DDL_IGNORING_REGEX      # Regex to ignore when comparing DDL structure.
+    STATE_MigrateData_DATETIME_COLUMN   # Name of column of *Int* or DateTime type, according what, to migrate data sequentially.
+    STATE_MigrateData_DIRECTION         # 'ASC' or 'DESC' datetime direction of data migration. Defaults to 'DESC'
+    STATE_MigrateData_TIMESLOT_INTERVAL # Data migration batch interval. Defaults to '4 HOUR'
+    STATE_MigrateData_CONCURRENCY       # Data migration concurrency for each POD. Defaults to 1.
+    STATE_MigrateData_CONCURRENCY_MODE  # Data migration concurrency mode, 'thread' or 'process'. Defaults to 'process'.
+    STATE_MigrateData_POD_SCRIPTS       # Internal state
+    STATE_MigrateData_SCRIPTS_COMPLETED # Internal state
+    STATE_ConsistencyReport_TIMESLOT_INTERVAL # Defaults to $STATE_MigrateData_TIMESLOT_INTERVAL
+    STATE_WaitPartsStable_LAST_NUMBER_OF_PARTS  # Internal state
+    STATE_WaitPartsStable_STABLE_THRESHOLD      # Defaults to 1
+    STATE_WaitPartsStable_INTERVAL              # Interval to check number of parts to become stable. Defaults to 0 (seconds), which means it waits
+                                                # only until no active merges in table.
+    STATE_WaitBusyReplicatedFetches_THRESHOLD   # Defaults to 0
+    STATE_WaitBusyReplicatedMerges_THRESHOLD    # Defaults to 0
+    STATE_WaitBusyMerges_THRESHOLD                      # Defaults to 0
+    STATE_WaitMaterializationDone_INTERVAL              # Defaults to 10 (seconds)
+    STATE_MovePartitions_CONCURRENCY        # Concurrently move partitions from table $LOCAL_TABLE_DT to $LOCAL_TABLE. High concurrency poses
+                                            # heavy load on ZooKeeper with replicated table engines. Defaults to 1
+    STATE_MovePartitions_DIRECTION          # Move partitions in 'ASC' or 'DESC' order. Defaults to 'ASC'.
+    STATE_MovePartitions_POD_SCRIPTS        # Internal state
+    STATE_MovePartitions_SCRIPTS_COMPLETED  # Internal state
+    STATE_DropTables_DROP_OLD_TABLE               # Drop the old table ? All data in old table has been migrated to the new table at this point.
+                                                  # Defaults to 'false'
+    STATE_DropTables_DROP_OLD_TABLE_IF_CONSISTENT # Drop the old table if data is consistent between tables $LOCAL_TABLE_DT and $LOCAL_TABLE_CHAMELEON
+                                                  # as reported by ConsistencyReport. All data in old table has been migrated to the new table at this
+                                                  # point. Defaults to 'false'
+)
+
+declare -a config_required_state_variables=(
+    # These state variables should be specified by user in '<TASK_DIR>/config'.
+    CLUSTER           # Defaults to '{cluster}'
+    DATABASE          # Can be auto discovered by 'init' command if there's only one database containing a table with name $LOCAL_TABLE
+    LOCAL_TABLE       # Name of the table to migrate
+    DISTRIBUTED_TABLE # Can be auto discovered by 'init' command if there's only one Distributed table referencing $LOCAL_TABLE
+    NEW_DDL_REFERENCE # In 'init' command, file '$NEW_DDL_REFERENCE' will be populated with CREATE TABLE query of the new table according to command
+                      # line flags like '--partitionby'/'--orderby'.
+    STATE_MigrateData_DATETIME_COLUMN
+    # STATE_MigrateData_AXIS_COLUMN # TODO refactor data migration script to use a generic axis column.
+)
+
+function variables_declaration() { for var; do declare -p $var 2>/dev/null | sed -r '1{ /^declare -[-aAfFgilrtux ]*a/{ s|\[[0-9]+\]=||g }; s|^declare |declare -g |g}'; done; }
+
+function load()
+{
+    if ! [ -f $DIR/state ]; then log_error "State file $DIR/state does not exist."; exit 1; fi
+    {
+        flock -x 10;
+        unset ${state_variables[@]}
+        source $DIR/state
+        [ -f $DIR/state.override ] && source $DIR/state.override;
+
+    } 10< $DIR/state
+
+    log_trace "load: STATE=$STATE DIRTY=$DIRTY PAUSED=$PAUSED"
+}
+
+function store()
+{
+    if (($# != 3)); then log_error "Wrong number of arguments passed to store(): $#, should be 3."; exit 1; fi
+    {
+        flock -x 10;
+        disable_signals SIGINT SIGTERM SIGTSTP EXIT
+
+        STATE=${1:-$STATE} DIRTY=${2:-$DIRTY} PAUSED=${3:-$PAUSED}
+
+        if [ -f $DIR/state.override ]; then
+            if [ $(cat $DIR/state.override | wc -l) -gt 1024 ]; then
+                log_error "Too many lines in '$DIR/state.override', refusing to include it."
+                command mv $DIR/state.override $DIR/state.override.refused
+            else
+                source $DIR/state.override && rm -f $DIR/state.override;
+            fi
+        fi
+        variables_declaration ${state_variables[@]} >&10
+
+        restore_signals SIGINT SIGTERM SIGTSTP EXIT
+    } 10> $DIR/state
+
+    log_trace "store: STATE=$STATE DIRTY=$DIRTY PAUSED=$PAUSED"
+
+    if [ -f $SIGNAL_QUEUE_FILE ]; then
+        local signals=$(cat $SIGNAL_QUEUE_FILE; rm -f $SIGNAL_QUEUE_FILE)
+        for sig in $signals; do kill -s $sig -- -$$; done
+    fi
+
+    if [ ${WAIT_PAUSED:-'true'} == true ]; then wait_paused; fi # nasty but works fine
+}
+
+# store_override var1 var2 var3
+function store_override()
+{(
+    set -e;
+    { flock -x 10; variables_declaration "$@" >&10; } 10>> $DIR/state.override;
+    log_debug "Wrote '$RELATIVE_DIR/state.override'"
+)}
+
+function set_dirty() { store '' "$1" ''; log_debug "set_dirty($1): DIRTY=$DIRTY"; }
+
+# Note: Do not call load/store/pause/wait_paused in subshells unless you know what you're doing.
+
+function pause()
+{
+    local immediately=${1:-'true'};
+    flock -x $DIR/state echo "declare -g PAUSED=true" >> $DIR/state.override
+    WAIT_PAUSED=$immediately store '' '' '';
+}
+
+function paused() { load; [ "$PAUSED" == true ]; }
+
+function wait_paused()
+{
+    if paused; then
+        log_info "Paused, waiting to resume...";
+        while paused; do sleep 1; done
+    fi
+}
+
+# State names should be unique
+declare -ga states_full=(
+    Initialize
+    CreateTables
+    DropProjectionsAndIndexes
+    RedirectDistributedView
+    SwapTables
+    StopTTLMerges
+    WaitPartsStableChameleon
+    PreMigrateData
+    MigrateData # Depends on PreMigrateData
+    WaitPartsStableDT
+    ConsistencyReport
+    Pause_IfNotConsistent
+    CopyDDLProjectionsAndIndexes
+    MaterializeProjectionsAndIndexes
+    WaitMaterializationDone
+    RedirectMergedView
+    PreMovePartitions
+    MovePartitions # Depends on PreMovePartitions
+    RestoreDistributedView
+    StartTTLMerges
+    DropTables
+    Complete
+)
+
+declare -ga states_full_no_stop_ttl=(
+    $(IFS=$'\n'; echo "${states_full[*]}" | grep -vw -e StartTTLMerges -e StopTTLMerges)
+)
+
+declare -ga states_simple=(
+    Initialize
+    CreateTables
+    RedirectDistributedView
+    SwapTables
+    WaitPartsStableChameleon
+    PreMigrateData
+    MigrateData
+    WaitPartsStableDT
+    ConsistencyReport
+    Pause_IfNotConsistent
+    RedirectMergedView
+    PreMovePartitions
+    MovePartitions
+    RestoreDistributedView
+    DropTables
+    Complete
+)
+
+declare -ga states_simplest=(
+    Initialize
+    CreateTables
+    SwapTables
+    ConsistencyReport
+    DropTables
+    Complete
+)
+
+declare -ga states_lazy=(
+    Initialize
+    CreateTables
+    RedirectDistributedView
+    SwapTables
+    Pause_ForLazy
+    DropTables
+    Complete
+)
+
+declare -ga states_copy=(
+    Initialize
+    DropProjectionsAndIndexes
+    PreMigrateData
+    MigrateData
+    ConsistencyReport
+    WaitPartsStableDT
+    CopyDDLProjectionsAndIndexes
+    MaterializeProjectionsAndIndexes
+    WaitMaterializationDone
+    Complete
+)
+
+declare -ga states_copy_simple=(
+    Initialize
+    PreMigrateData
+    MigrateData
+    ConsistencyReport
+    WaitPartsStableDT
+    Complete
+)
+
+declare -ga states=()
+
+declare -ga procedures=( 'full' 'full_no_stop_ttl' 'simple' 'simplest' 'lazy' )
+
+declare -g PROCEDURE=''
+
+function get_previous_state()
+{
+    local cur=${1:-$STATE} res='Initialize'
+
+    for i in ${!states[@]}; do
+        if [ ${states[i]} == "$cur" ]; then res=${states[i-1]}; break; fi
+    done
+    echo "$res"
+}
+
+function get_next_state()
+{
+    local cur=${1:-$STATE} res='Initialize'
+    [ "$cur" == 'Complete' ] && { echo 'Complete'; return; }
+
+    for i in ${!states[@]}; do
+        if [ ${states[i]} == "$cur" ]; then res=${states[i+1]}; break; fi
+    done
+    echo "$res"
+}
+
+function expand_macro()
+{(
+    set -e;
+    local macro_name=$1;
+    local macro_value=$macro_name;
+    if [[ "$macro_name" =~ '{' ]]; then
+        macro_name=$(echo "$macro_name" | tr -d '{}')
+        macro_value=$(kube_chc_query "SELECT getMacro('$macro_name')")
+        if [ -z "$macro_value" ]; then return 1; fi
+    fi
+    echo "$macro_value"
+)}
+
+function show_create_table() { kube_chc_query "SHOW CREATE TABLE \`$DATABASE\`.\`$1\` FORMAT TSVRaw"; }
+
+function table_exists_on_cluster()
+{(
+    set -e;
+    local table=$1 all=${2:-true};
+
+    local expr="count_hosts == count()"; [ "$all" != true ] && expr="count() > 0" || :;
+
+    kube_chc_query "
+        WITH ( SELECT count() FROM system.clusters WHERE cluster='$EXPANDED_CLUSTER' ) AS count_hosts
+        SELECT $expr
+        FROM clusterAllReplicas('$CLUSTER', system.tables)
+        WHERE database='$DATABASE' AND table='$table'
+    "
+)}
+
+## Functions for States
+
+# Check configuration and initialize some internal variables
+function s_Initialize()
+{
+    if ! [ -f "$DIR/config" ]; then log_state_error "Configuration file does not exist: '$RELATIVE_DIR/config'"; return 1; fi
+
+    declare -gA STATES_START_TIME=(['Initialize']=$(timestamp))
+    # declare -g CLUSTER='{cluster}' # ON CLUSTER '?'
+    # declare -g DATABASE='business'
+    # declare -g LOCAL_TABLE='tcp_log_local'
+    # declare -g DISTRIBUTED_TABLE='tcp_log'
+    declare -g DISTRIBUTED_TABLE_SHARDING_KEY='rand()'
+    # declare -g NEW_DDL_REFERENCE='tcp_log_new.sql'
+    declare -g ENGINE_REPLICATED=false
+    declare -g ENGINE_DEDUPLICATING=false
+
+    source $DIR/config
+
+    set_chc_params false --receive_timeout=36000 --lock_acquire_timeout=36000 --distributed_ddl_task_timeout=36000;
+    set_chc_params true --history_file=/tmp/.clickhouse-history "--log_comment=table-migration-task-${TASK_NAME}"
+
+    # Check configuration complete
+    local config_complete=true
+    for var in ${config_required_state_variables[@]}; do
+        if [ "${!var}" == "" ]; then
+            log_state_error "Variable '$var' is not defined in config '$RELATIVE_DIR/config', please define it and resume the task."
+            config_complete=false
+        fi
+    done
+    if [ $config_complete == false ]; then pause false; return 1; fi
+
+    if [ -z "$EXPANDED_CLUSTER" ]; then
+        if ! EXPANDED_CLUSTER=$(expand_macro $CLUSTER); then
+            log_state_error "Error retrieving value of macro '$CLUSTER', please revise the config and resume the task."
+            pause false; return 1
+        fi
+    fi
+
+    s_CheckDatabaseAtomic || return 1
+
+    # Wrap $STATE_MigrateData_DATETIME_COLUMN with toDateTime()
+    local datetime_column_type
+    datetime_column_type=$(kube_chc_query "SELECT type FROM system.columns WHERE database='$DATABASE' AND table='$LOCAL_TABLE' AND name='$STATE_MigrateData_DATETIME_COLUMN'")
+    if [ -z "$datetime_column_type" ]; then
+        log_state_error "Not found column '$STATE_MigrateData_DATETIME_COLUMN' in table \`$DATABASE\`.\`$LOCAL_TABLE\`, please revise the config and resume the task."
+        pause false; return 1
+    fi
+    if [[ $datetime_column_type =~ 'Int' ]]; then
+        STATE_MigrateData_DATETIME_COLUMN="toDateTime($STATE_MigrateData_DATETIME_COLUMN)"
+        log_state_debug "Set STATE_MigrateData_DATETIME_COLUMN=$STATE_MigrateData_DATETIME_COLUMN"
+    fi
+
+    # Assign table names and UUIDs
+    LOCAL_TABLE_CHAMELEON="${LOCAL_TABLE}__CHAMELEON"
+    LOCAL_TABLE_DT="${LOCAL_TABLE}__DT"
+    LOCAL_TABLE_MERGED="${LOCAL_TABLE}__MERGED"
+
+    UUID_CHAMELEON=$(uuidgen); UUID_DT=$(uuidgen)
+
+    # Check successful assignment of variables
+    local variables_complete=true
+    for var in LOCAL_TABLE_CHAMELEON LOCAL_TABLE_DT LOCAL_TABLE_MERGED UUID_CHAMELEON UUID_DT; do
+        if [ "${!var}" == "" ]; then
+            log_state_error "Variable '$var' is not assigned successfully"
+            variables_complete=false
+        fi
+    done
+    if [ $variables_complete == false ]; then return 1; fi # Retry it
+
+    assign_ddl_queries || return 1
+
+    # Check tables exist
+    if ! kube_chc_query_all "SELECT 1" >/dev/null; then
+        log_state_error "Cannot connect to ClickHouse server."
+        pause false; return 1;
+    fi
+
+    local pids="" tmp_exists_1=$(mktmp) tmp_exists_2=$(mktmp) tmp_exists_3=$(mktmp)
+    (table_exists_on_cluster $LOCAL_TABLE true > $tmp_exists_1) & pids+=" $!"
+    (table_exists_on_cluster $LOCAL_TABLE_CHAMELEON false > $tmp_exists_2) & pids+=" $!"
+    (table_exists_on_cluster $DISTRIBUTED_TABLE true > $tmp_exists_3) & pids+=" $!"
+
+    wait_pids_patiently 5 "$pids" "$LOCAL_TABLE-exists $LOCAL_TABLE_CHAMELEON-exists $DISTRIBUTED_TABLE-exists" || {
+        log_error "Error while checking existence of tables: $LOCAL_TABLE, $LOCAL_TABLE_CHAMELEON, $DISTRIBUTED_TABLE".
+        return 1
+    }
+    if [ "$(cat $tmp_exists_1; rm -f $tmp_exists_1)" == '0' ]; then
+        log_state_error "Table \`$DATABASE\`.\`$LOCAL_TABLE\` does not exist, please revise the config before resuming the task."
+        pause false; return 1;
+    fi
+    if [ "$(cat $tmp_exists_2; rm -f $tmp_exists_2)" == '1' ]; then
+        log_state_error "Table \`$DATABASE\`.\`$LOCAL_TABLE_CHAMELEON\` already exists, please have a check before resuming the task."
+        pause false; return 1;
+    fi
+    if [ "$(cat $tmp_exists_3; rm -f $tmp_exists_3)" == '0' ]; then
+        log_state_error "Table \`$DATABASE\`.\`$DISTRIBUTED_TABLE\` does not exist, please revise the config before resuming the task."
+        pause false; return 1;
+    fi
+
+    s_CheckDataVisibility || return 1;
+
+    if [ -z "$PROCEDURE" ]; then
+        s_Rearrange || return 1;
+    elif [ ${#states[@]} -eq 0 ]; then
+        switch_procedure $PROCEDURE;
+    fi
+
+    # Warning on migrating non-classic MergeTree tables
+    if [[ "$ENGINE_DEDUPLICATING" == true && "$PROCEDURE" != 'lazy' && "$PROCEDURE" != 'simplest' ]]; then
+        log_warn "Table '$LOCAL_TABLE' uses a non-classic MergeTree. It is highly likely that data was deduplicated during migration, making it difficult to determine whether it is consistent with the original table. We recommend: 1) Run \`rearrange $RELATIVE_DIR lazy\` to switch to the lazy procedure, which avoids data migration; 2) Run query \"OPTIMIZE TABLE \`$DATABASE\`.\`$LOCAL_TABLE_CHAMELEON\` FINAL\" on ClickHouse servers (at your own risk) before resuming the task."
+        pause false;
+    fi
+
+    truncate --no-create --size=0 $DIR/last_error
+
+    declare -gA STATES_FINISH_TIME=(['Initialize']=$(timestamp))
+}
+
+function r_Initialize()
+{
+    REVERT=''; # Stop reverting here
+    store '' false false; # No pause
+    log_state_info "Reverted to initial state. Please resume to re-run the task if needed."
+    exit 0;
+}
+
+function switch_procedure()
+{
+    if ! [[ " ${procedures[*]} " =~ " $1 " ]]; then
+        log_error "Unknow procedure: $1, expecting one of '$(IFS='|'; echo "${procedures[*]}")'."
+        exit 1;
+    fi
+
+    PROCEDURE=$1;
+    states=( $(eval "echo \${states_$PROCEDURE[@]}") );
+
+    store_override states PROCEDURE
+    log_info "Procedure '$PROCEDURE'"
+}
+
+function mktable(){ local sep=${1:-$'\t'}; column -t -s "$sep"; }
+
+function s_CheckDatabaseAtomic()
+{(
+    set -e;
+    local res
+
+    log_info "Checking if database '$DATABASE' is Atomic"
+    res=$(kube_chc_query "SELECT arrayStringConcat(groupUniqArray(engine), '') FROM clusterAllReplicas('$CLUSTER', system.databases) WHERE database='$DATABASE'")
+
+    if [[ "$res" != 'Atomic' ]]; then
+        log_error "Database '$DATABASE' is not of Atomic engine."
+        return 1;
+    fi
+)}
+
+function s_CheckDataVisibility()
+{(
+    set -e;
+    local res diff user
+    res=$(kube_chc_query "
+        SELECT currentUser();
+        WITH
+            ( SELECT sum(total_rows) FROM clusterAllReplicas('$CLUSTER',system.tables) WHERE database='$DATABASE' AND table='$LOCAL_TABLE' ) AS actual_rows,
+            ( SELECT sum(count) FROM (SELECT count() AS count FROM clusterAllReplicas('$CLUSTER','$DATABASE','$LOCAL_TABLE') GROUP BY _part) ) AS visible_rows
+        SELECT actual_rows AS \`Actual Rows\`, visible_rows AS \`Visible Rows\`, (actual_rows - visible_rows) AS Diff, round(Diff * 100 / actual_rows) AS \`Diff %\`
+        FORMAT TabSeparatedWithNames
+    " -n)
+    user=$(head -1 <<<"$res")
+    res=$(tail -n+2 <<<"$res")
+
+    IFS=$'\t' read _ _ diff _ <<<"$(index_line 2 "$res")"
+
+    if [ -z "$diff" ]; then log_state_error "Failed to check data visibility on table '$LOCAL_TABLE'."; return 1; fi
+    if ((diff > 0)); then
+        log_state_error "Data in table '$LOCAL_TABLE' is partially visible to current user '$user':${RST}\n$res"
+        pause false; return 1
+    fi
+)}
+
+# Rearrange states
+function s_Rearrange()
+{
+    (
+        set -e;
+        local threshold=${STATE_Rearrange_THRESHOLD:-'1000000'}
+        local res;
+        res=$(kube_chc_query "SELECT max(count) FROM (SELECT count() AS count FROM clusterAllReplicas('$CLUSTER','$DATABASE','$LOCAL_TABLE') GROUP BY hostname())")
+
+        if ((res == 0)); then # Simplest states flow
+            log_state_info "Table '$LOCAL_TABLE' is empty, going with the simplest procedure."
+            switch_procedure simplest
+            STATE_DropTables_DROP_OLD_TABLE_IF_CONSISTENT=true;
+        elif ((res <= threshold)); then # Simple states flow
+            log_state_info "Table '$LOCAL_TABLE' contains a small amount of data, will rearrange to a simple procedure."
+            switch_procedure simple
+            if [ -z "$STATE_MigrateData_TIMESLOT_INTERVAL" ]; then STATE_MigrateData_TIMESLOT_INTERVAL='10 DAY'; fi
+        else # Full states flow
+            switch_procedure full
+        fi
+        store '' '' '';
+    ) && load;
+}
+
+function r_Rearrange() { return 0; }
+
+# DDL query should be formated first
+function ddl_replace_zk_path()
+{
+    local new_path=$1;
+    sed -r "s|^(ENGINE = Replicated.*MergeTree)\('([^']*)'|\1('${ZOOKEEPER:+$ZOOKEEPER:}$new_path'|";
+}
+
+function assign_ddl_queries()
+{
+    if [ "$(kube_chf_query 'select 1')" != "SELECT 1" ]; then
+        log_state_error "Error trying to format a simple query.";
+        return 1;
+    fi
+    # Format the reference CREATE TABLE query
+    if ! [ -f "$DIR/$NEW_DDL_REFERENCE" ]; then
+        log_state_error "DDL template file does not exist: $DIR/$NEW_DDL_REFERENCE."
+        return 1;
+    fi
+    local create_table_query=$(kube_chf_query "$(cat $DIR/$NEW_DDL_REFERENCE)")
+    # CREATE TABLE <DATABASE>.<TABLE> UUID '<UUID>' ON CLUSTER '<CLUSTER>'
+    create_table_query=$(echo "$create_table_query" | sed -re "s|^CREATE .+|CREATE TABLE \`$DATABASE\`.\`<TABLE>\` UUID '<UUID>' ON CLUSTER '$CLUSTER'|")
+    # ENGINE = ReplicatedMergeTree('/clickhouse/tables/{shard}/<DATABASE>/<LOCAL_TABLE>/<UUID>', '{replica}')
+    create_table_query=$(echo "$create_table_query" | ddl_replace_zk_path "/clickhouse/tables/{shard}/$DATABASE/$LOCAL_TABLE/<UUID>")
+
+    DDL_TEMPLATE=$create_table_query
+    if [ -z "$DDL_TEMPLATE" ]; then
+        log_state_error "Variable 'DDL_TEMPLATE' is not assigned successfully"
+        return 1
+    fi
+    log_state_debug "Template of create table query: \n$DDL_TEMPLATE"
+
+    # Using Replicated MergeTree engine ?
+    [[ -n "$(sed -nr '/^ENGINE = Replicated.*MergeTree/p' <<<"$DDL_TEMPLATE")" ]] && ENGINE_REPLICATED=true || :;
+    [[ -n "$(sed -nr '/^ENGINE = (Replicated)?(Replacing|Summing|Aggregating|VersionedCollapsing)MergeTree/p' <<<"$DDL_TEMPLATE")" ]] && ENGINE_DEDUPLICATING=true || :;
+
+    DDL_ON_CLUSTER_CHAMELEON=$(sed -re "s|<TABLE>|$LOCAL_TABLE_CHAMELEON|g; s|<UUID>|$UUID_CHAMELEON|g" <<<"$DDL_TEMPLATE")
+    DDL_ON_CLUSTER_DT=$(sed -re "s|<TABLE>|$LOCAL_TABLE_DT|g; s|<UUID>|$UUID_DT|g" <<<"$DDL_TEMPLATE")
+
+    DDL_ON_CLUSTER_MERGE_CHAMELEON="
+    CREATE OR REPLACE TABLE \`$DATABASE\`.\`$LOCAL_TABLE_MERGED\` ON CLUSTER '$CLUSTER' AS \`$DATABASE\`.\`$LOCAL_TABLE\`
+    ENGINE = Merge('$DATABASE', '^($LOCAL_TABLE|$LOCAL_TABLE_CHAMELEON)\$')
+    "
+    DDL_ON_CLUSTER_MERGE_DT="
+    CREATE OR REPLACE TABLE \`$DATABASE\`.\`$LOCAL_TABLE_MERGED\` ON CLUSTER '$CLUSTER' AS \`$DATABASE\`.\`$LOCAL_TABLE\`
+    ENGINE = Merge('$DATABASE', '^($LOCAL_TABLE|$LOCAL_TABLE_DT)\$')
+    "
+    # Before tables swapped
+    DDL_ON_CLUSTER_DISTRIBUTED_MERGED="
+    CREATE OR REPLACE TABLE \`$DATABASE\`.\`$DISTRIBUTED_TABLE\` ON CLUSTER '$CLUSTER' AS \`$DATABASE\`.\`$LOCAL_TABLE_CHAMELEON\`
+    ENGINE = Distributed('$CLUSTER', '$DATABASE', '$LOCAL_TABLE_MERGED', $DISTRIBUTED_TABLE_SHARDING_KEY)
+    "
+    DDL_ON_CLUSTER_DISTRIBUTED="
+    CREATE OR REPLACE TABLE \`$DATABASE\`.\`$DISTRIBUTED_TABLE\` ON CLUSTER '$CLUSTER' AS \`$DATABASE\`.\`$LOCAL_TABLE\`
+    ENGINE = Distributed('$CLUSTER', '$DATABASE', '$LOCAL_TABLE', $DISTRIBUTED_TABLE_SHARDING_KEY)
+    "
+}
+
+function ensure_state_functions_defined()
+{
+    local -A states_set=()
+    local duplicate=false
+
+    for state in ${states[@]}; do
+        if [[ ! "$state" =~ ^[a-zA-Z0-9_]+$ ]]; then
+            log_error "Invalid state name '$s'.";
+            exit 1
+        fi
+        states_set[$state]=$((${states_set[$state]:-0} + 1))
+        if ((${states_set[$state]} > 1)); then
+            log_error "Duplicate state name: $state"
+            duplicate=true;
+        fi
+        if [[ $state =~ ^'Pause_'[0-9a-zA-Z_]+$ ]]; then
+            if ! func_defined "s_$state" || ! func_defined "r_$state"; then
+                eval "function s_$state() { s_Pause; return 0; }"
+                eval "function r_$state() { r_Pause; return 0; }"
+            fi
+        fi
+        if ! func_defined "s_$state"; then
+            log_error "Unknown state '$state': state function for '$state' is not defined.";
+            exit 1;
+        fi
+    done
+    if [ -n "$STATE" ] && ! func_defined "s_$STATE"; then
+        log_error "Unknown state '$STATE', please manually revert to one of these states: $(IFS='|'; echo "${states[*]}")";
+        exit 1;
+    fi
+    if [ $duplicate == true ]; then exit 1; fi
+}
+
+# Returns false if the distributed DDL queue is busy.
+function s_CheckBusyDistributedDDLQueue()
+{
+    local max_ddl_age=${1:-'0'}; # Max age of unfinished DDL entries to consider the queue as 'busy'
+    local result sql="SELECT entry,query_create_time,host,replaceRegexpAll(query,'(\n *)|( {2,})',' ') AS query
+        FROM system.distributed_ddl_queue
+        WHERE status!='Finished' AND (now() - query_create_time) >= $max_ddl_age
+        ORDER BY query_create_time ASC
+        LIMIT 10
+        FORMAT PrettyCompactMonoBlock"
+
+    log_state_info "Checking distributed DDL queue ..."
+    result=$(kube_chc_query "$sql")
+
+    if [ -n "$result" ]; then
+        log_state_debug "${NC}\n$result"
+        return 1;
+    fi
+    return 0;
+}
+
+function r_CheckBusyDistributedDDLQueue() { s_CheckBusyDistributedDDLQueue; }
+
+function s_WaitOnBusyDistributedDDLQueue()
+{
+    while ! s_CheckBusyDistributedDDLQueue $1; do
+        log_state_warn "Distributed DDL queue is busy, should re-check later."
+        sleep 10;
+    done
+}
+
+function r_WaitOnBusyDistributedDDLQueue() { s_WaitOnBusyDistributedDDLQueue; }
+
+# Readonly tables can still be RENAME/EXCHANGE-ed.
+function s_CheckTablesNotReadOnly()
+{(
+    set -e
+    if [ "$ENGINE_REPLICATED" != true ]; then return 0; fi # Non-replicated tables cannot be readonly.
+
+    local tables=( "$@" );
+    if [ ${#tables[@]} == 0 ]; then tables=( "$LOCAL_TABLE" "$LOCAL_TABLE_CHAMELEON" "$LOCAL_TABLE_DT" ); fi
+
+    tables=( $(IFS=$'\n'; echo "${tables[*]}" | sed -r "s|^.*$|'&'|") ) # Wrap each element in ''
+
+    local result query="SELECT hostname() AS host,database,table,is_session_expired,is_readonly,future_parts,zookeeper_name,zookeeper_exception,last_queue_update_exception
+        FROM clusterAllReplicas('$CLUSTER',system.replicas)
+        WHERE is_readonly AND database='$DATABASE' AND table IN ( $(IFS=','; echo "${tables[*]}") )
+        ORDER BY host,database,table
+        FORMAT PrettyCompactMonoBlock"
+
+    log_state_info "Checking readonly state of replicated MergeTree tables: ${tables[*]}"
+    result=$(kube_chc_query "$query")
+
+    if [ -n "$result" ]; then
+        log_state_info "Some local tables are in readonly state:${NC}\n$result"
+        return 1;
+    fi
+    return 0;
+)}
+
+function r_CheckTablesNotReadOnly() { s_CheckTablesNotReadOnly; }
+
+# system.table_settings
+function s_CreateOrReplaceTableSystemTableSettings()
+{(
+    set  -e;
+    log_debug "Creating table system.table_settings"
+    local ddl_system_table_settings="CREATE OR REPLACE TABLE system.table_settings ENGINE = Memory AS
+        WITH
+            regexpExtract(create_table_query, ' SETTINGS ((?:,? ?[a-z_]+ = [^ ,]+)+)', 1) AS settings_str,
+            arrayMap(x -> splitByString(' = ', x), extractAll(settings_str, '([a-z_]+ = [^ ,]+)')) AS settings,
+            arrayJoin(settings) AS setting
+        SELECT database,table,setting[1] AS name,setting[2] AS value
+        FROM system.tables
+        WHERE database NOT IN ('system', 'INFORMATION_SCHEMA', 'information_schema')
+        ORDER BY database,table,name"
+    kube_chc_query "$ddl_system_table_settings";
+)}
+
+function r_CreateOrReplaceTableSystemTableSettings() { kube_chc_query "DROP TABLE IF EXISTS system.table_settings SYNC"; }
+
+function s_CreateTables()
+{(
+    set -e; # Fine, we are not changing any variable here
+    s_CheckTablesNotReadOnly || :;
+    s_WaitOnBusyDistributedDDLQueue 0;
+
+    # Chameleon table
+    log_state_info "Creating table $LOCAL_TABLE_CHAMELEON"
+    kube_chc_query "$DDL_ON_CLUSTER_CHAMELEON"
+
+    # Data transformation table
+    log_state_info "Creating table $LOCAL_TABLE_DT"
+    kube_chc_query "$DDL_ON_CLUSTER_DT"
+
+    # Merge table
+    log_state_info "Creating table $LOCAL_TABLE_MERGED"
+    kube_chc_query "$DDL_ON_CLUSTER_MERGE_CHAMELEON"
+
+    # Table settings
+    log_state_info "Adjusting table settings for better ingestion behavior"
+    kube_chc_query "
+        ALTER TABLE \`$DATABASE\`.\`$LOCAL_TABLE_DT\` ON CLUSTER '$CLUSTER'
+            MODIFY SETTING
+                number_of_free_entries_in_pool_to_execute_mutation=1,
+                replicated_deduplication_window=0,
+                non_replicated_deduplication_window=0,
+                old_parts_lifetime=60,
+                max_parts_in_total=100000,
+                parts_to_delay_insert=100000,
+                parts_to_throw_insert=100000
+        " --echo;
+
+    local v=${REPLICATED_MUTATION_THREADS:-'2'};
+    if [ "$ENGINE_REPLICATED" == true ]; then
+        kube_chc_query "ALTER TABLE \`$DATABASE\`.\`$LOCAL_TABLE_DT\` ON CLUSTER '$CLUSTER' MODIFY SETTING max_replicated_mutations_in_queue=$v;" --echo;
+    fi
+)}
+
+function r_CreateTables()
+{
+    RELOAD=true;
+(
+    set -e;
+    local res count1 count2
+    res=$(kube_chc_query "
+        SELECT table AS Table, sum(total_rows) AS \`Total Rows\`
+        FROM clusterAllReplicas('$CLUSTER', system.tables)
+        WHERE database='$DATABASE' AND table IN ('$LOCAL_TABLE_CHAMELEON', '$LOCAL_TABLE_DT')
+        GROUP BY table
+        ORDER BY table
+        FORMAT TabSeparatedWithNames
+    ")
+    local col_total_rows=$(FS=$'\t' awk '{print$2}' <<<"$res")
+
+    count1=$(index_line 2 "$col_total_rows"); count2=$(index_line 3 "$col_total_rows")
+    if ((count1 != 0 || count2 != 0)); then
+        log_state_error "Tables not empty. This is unexpected:${RST}\n$(echo "$res" | column -t -s $'\t' | indent)"
+        pause false; return 1;
+    fi
+    LOG_PREFIX=true kube_chc_query_all "DROP TABLE IF EXISTS \`$DATABASE\`.\`$LOCAL_TABLE_CHAMELEON\` SYNC" --echo;
+    LOG_PREFIX=true kube_chc_query_all "DROP TABLE IF EXISTS \`$DATABASE\`.\`$LOCAL_TABLE_DT\` SYNC" --echo;
+    LOG_PREFIX=true kube_chc_query_all "DROP TABLE IF EXISTS \`$DATABASE\`.\`$LOCAL_TABLE_MERGED\` SYNC" --echo;
+    log_state_info "Dropped tables: $LOCAL_TABLE_CHAMELEON, $LOCAL_TABLE_DT, $LOCAL_TABLE_MERGED";
+)}
+
+# ALTER TABLE $LOCAL_TABLE_DT [ON CLUSTER <cluster>] <ADD|DROP|MATERIALIZE|CLEAR> <INDEX|PROJECTION> [IF [NOT] EXISTS] <name>
+function get_ddl_indexes_and_projections()
+{
+    local -u action=${1:-'ADD'}
+    local conditional=${2:-'true'} on_cluster=${3:-'true'}
+
+    local if_exists='' if_not_exists='';
+    if [ $conditional == true ]; then if_exists="IF EXISTS"; if_not_exists="IF NOT EXISTS"; fi
+    if [ $on_cluster == true ]; then on_cluster="ON CLUSTER '$CLUSTER'"; else on_cluster=''; fi
+
+    if [ $action == 'ADD' ]; then
+
+        local indexes_and_projections=$(echo "$DDL_TEMPLATE" | sed -nr '/^    INDEX /p; /^    PROJECTION /,/^    \)/p')
+
+        if [ -z "$indexes_and_projections" ]; then return 0; fi
+
+        echo -e "ALTER TABLE \`$DATABASE\`.\`$LOCAL_TABLE_DT\` $on_cluster\n$indexes_and_projections" \
+            | sed -r "s/^    INDEX /    ADD INDEX $if_not_exists /g; s/^    PROJECTION /    ADD PROJECTION $if_not_exists /g" \
+            | sed '${s/,$//}'
+
+    elif [[ $action =~ ^('DROP'|'MATERIALIZE'|'CLEAR')$ ]]; then
+
+        local indexes_and_projections=$(echo "$DDL_TEMPLATE" | sed -nr 's|^(    INDEX [^ ]+) .+$|\1,|gp; s|^(    PROJECTION [^ ]+)|\1,|gp')
+
+        if [ -z "$indexes_and_projections" ]; then return 0; fi
+
+        echo -e "ALTER TABLE \`$DATABASE\`.\`$LOCAL_TABLE_DT\` $on_cluster\n$indexes_and_projections" \
+            | sed -r "s/^    INDEX /    $action INDEX $if_exists /g; s/^    PROJECTION /    $action PROJECTION $if_exists /g" \
+            | sed '${s/,$//}'
+    else
+        log_state_error "Unknown clause '$action', expecting one of ADD|DROP|MATERIALIZE|CLEAR."
+        return 1;
+    fi
+}
+
+function s_DropProjectionsAndIndexes()
+{(
+    set -e;
+    local timeout=${STATE_DropProjectionsAndIndexes_DISTRIBUTED_DDL_TASK_TIMEOUT:-'21600'} # 6 hours
+
+    local ddl_on_cluster
+    ddl_on_cluster=$(get_ddl_indexes_and_projections DROP false true)
+
+    if [ -z "$ddl_on_cluster" ]; then return 0; fi
+
+    s_WaitOnBusyDistributedDDLQueue 0;
+    s_WaitOnBusyMutationsOnTable $LOCAL_TABLE_DT;
+
+    kube_chc_query "$ddl_on_cluster SETTINGS distributed_ddl_task_timeout=$timeout" --echo;
+)}
+
+function r_DropProjectionsAndIndexes()
+{(
+    set -e;
+    local ddl
+    ddl=$(get_ddl_indexes_and_projections ADD true false)
+
+    if [ -z "$ddl" ]; then return 0; fi
+
+    s_WaitOnBusyDistributedDDLQueue 0;
+    (
+        SERVER_PODS=( $(get_replicated_server_pods) );
+        LOG_PREFIX=true kube_chc_query_all "$ddl";
+    )
+)}
+
+function s_RedirectDistributedView()
+{(
+    set -e;
+    s_WaitOnBusyDistributedDDLQueue 0;
+    log_state_info "Redirecting distributed view to point to $LOCAL_TABLE_MERGED";
+    kube_chc_query "$DDL_ON_CLUSTER_DISTRIBUTED_MERGED" --echo;
+)}
+
+function r_RedirectDistributedView()
+{(
+    set -e;
+    s_WaitOnBusyDistributedDDLQueue 0;
+    kube_chc_query "$DDL_ON_CLUSTER_DISTRIBUTED" --echo;
+)}
+
+function normalize_ddl_for_comparison()
+{
+    local ddl=$1
+    local include_settings=${STATE_SwapTables_COMPARE_DDL_INCLUDING_SETTINGS:-'false'}
+    local ignored_regex=${STATE_SwapTables_COMPARE_DDL_IGNORING_REGEX:-'`_invert_flag`'}
+    # Remove table name and zookeeper path. maybe also remove the SETTINGS ?
+    local sed_remove_settings=''; [ $include_settings != true ] && sed_remove_settings='/^SETTINGS .+/d'
+    local sed_remove_ignored_regex=''; [ -n "$ignored_regex" ] && sed_remove_ignored_regex="/$ignored_regex/d"
+    echo "$ddl" | sed "1d; $sed_remove_ignored_regex; $sed_remove_settings"
+}
+
+function local_table_has_new_structure()
+{
+    # Check if structure of $LOCAL_TABLE is same as $DDL_ON_CLUSTER_CHAMELEON.
+    local ddl_local_table
+    ddl_local_table=$(show_create_table $LOCAL_TABLE)
+    ddl_normalized_local_table=$(normalize_ddl_for_comparison "$ddl_local_table")
+    ddl_normalized_templated_local_table=$(normalize_ddl_for_comparison "$DDL_ON_CLUSTER_CHAMELEON")
+
+    [ "$ddl_normalized_local_table" == "$ddl_normalized_templated_local_table" ];
+}
+
+function s_SwapTables()
+{(
+    set -e;
+    s_WaitOnBusyDistributedDDLQueue 0;
+    kube_chc_query "EXCHANGE TABLES \`$DATABASE\`.\`$LOCAL_TABLE\` AND \`$DATABASE\`.\`$LOCAL_TABLE_CHAMELEON\` ON CLUSTER '$CLUSTER'" --echo;
+)}
+
+function r_SwapTables()
+{(
+    set -e;
+    s_WaitOnBusyDistributedDDLQueue 0; # Wait until all servers become consistent.
+    # Had they actually exchanged ?
+    if local_table_has_new_structure; then
+        local res
+        res=$(kube_chc_query "
+            SELECT count
+            FROM (
+                SELECT 1 AS i, count() AS count FROM clusterAllReplicas('$CLUSTER','$DATABASE','$LOCAL_TABLE')
+                UNION ALL
+                SELECT 2 AS i, count() AS count FROM clusterAllReplicas('$CLUSTER','$DATABASE','$LOCAL_TABLE_CHAMELEON')
+            )
+            ORDER BY i ASC
+        ")
+        local count_local=$(index_line 1 "$res") count_local_chameleon=$(index_line 2 "$res")
+
+        log_state_debug "Total rows of table \`$DATABASE\`.\`$LOCAL_TABLE\`: $count_local, \`$DATABASE\`.\`$LOCAL_TABLE_CHAMELEON\`: $count_local_chameleon"
+
+        if (( count_local > 0 && count_local >= count_local_chameleon )); then
+            log_state_warn "Table \`$DATABASE\`.\`$LOCAL_TABLE\` has new structure, but the data amount is larger than that of \`$DATABASE\`.\`$LOCAL_TABLE_CHAMELEON\`. This is suspicious, please have a check before resuming the task."
+            pause false;
+            return 1;
+        fi
+        log_state_info "Table \`$DATABASE\`.\`$LOCAL_TABLE\` has new structure. Will exchange tables \`$DATABASE\`.\`$LOCAL_TABLE\` and \`$DATABASE\`.\`$LOCAL_TABLE_CHAMELEON\`"
+        kube_chc_query "EXCHANGE TABLES \`$DATABASE\`.\`$LOCAL_TABLE\` AND \`$DATABASE\`.\`$LOCAL_TABLE_CHAMELEON\` ON CLUSTER '$CLUSTER'" --echo;
+    else
+        log_state_info "Table \`$DATABASE\`.\`$LOCAL_TABLE\` does not have new structure. No thing to revert."
+    fi
+
+    # Some new data may have been inserted into the new table (Now it's named $LOCAL_TABLE_CHAMELEON because we reverted)
+    res=$(kube_chc_query "SELECT count() FROM clusterAllReplicas('$CLUSTER','$DATABASE','$LOCAL_TABLE_CHAMELEON')")
+
+    if (( res >= 1 )); then
+        log_state_info "Some data has been inserted into the new table \`$DATABASE\`.\`$LOCAL_TABLE_CHAMELEON\`, migrating it back to the old table \`$DATABASE\`.\`$LOCAL_TABLE\`."
+        s_CheckTablesNotReadOnly $LOCAL_TABLE;
+
+        local dst_table="\`$DATABASE\`.\`$LOCAL_TABLE\`" src_table="\`$DATABASE\`.\`$LOCAL_TABLE_CHAMELEON\`"
+        local datetime_column=$STATE_MigrateData_DATETIME_COLUMN interval=${STATE_MigrateData_TIMESLOT_INTERVAL:-'4 HOUR'}
+
+        local -a server_pods=( $(get_replicated_server_pods) )
+
+        trap_kill_group;
+
+        local pids='';
+        for pod in ${server_pods[@]}; do
+            ./for_each_line2.sh --log-level $LOG_LEVEL \
+                --file "$DIR/revert.dt.$pod.sql" --pod $pod \
+                --chc "${CHC_FLAGS[*]}" \
+                --templated-generator gen insert_select_with_columns_by_timeslot \
+                "dst_table=$dst_table,src_table=$src_table,datetime_column=$datetime_column,interval=$interval,direction=DESC" &
+            pids+=" $!"
+        done
+        for pid in $pids; do wait $pid; done
+
+        trap_restore_kill_group;
+        rm -rf $DIR/revert.dt.*.sql $DIR/revert.dt.*.sql.state
+
+        kube_chc_query "TRUNCATE TABLE \`$DATABASE\`.\`$LOCAL_TABLE_CHAMELEON\` ON CLUSTER '$CLUSTER'" --echo;
+    fi
+)}
+
+function s_StopTTLMerges()
+{(
+    set -e;
+    s_WaitOnBusyDistributedDDLQueue 0;
+    kube_chc_query "SYSTEM STOP TTL MERGES ON CLUSTER '$CLUSTER' \`$DATABASE\`.\`$LOCAL_TABLE_DT\`" --echo;
+    kube_chc_query "SYSTEM STOP TTL MERGES ON CLUSTER '$CLUSTER' \`$DATABASE\`.\`$LOCAL_TABLE_CHAMELEON\`" --echo; # The old table
+)}
+
+function r_StopTTLMerges()
+{(
+    set -e;
+    s_WaitOnBusyDistributedDDLQueue 0;
+    kube_chc_query "SYSTEM START TTL MERGES ON CLUSTER '$CLUSTER' \`$DATABASE\`.\`$LOCAL_TABLE_DT\`" --echo;
+    kube_chc_query "SYSTEM START TTL MERGES ON CLUSTER '$CLUSTER' \`$DATABASE\`.\`$LOCAL_TABLE_CHAMELEON\`" --echo; # The old table
+)}
+
+function s_StartTTLMerges()
+{(
+    set -e;
+    s_WaitOnBusyDistributedDDLQueue 0;
+    kube_chc_query "SYSTEM START TTL MERGES ON CLUSTER '$CLUSTER' \`$DATABASE\`.\`$LOCAL_TABLE_DT\`" --echo;
+    kube_chc_query "SYSTEM START TTL MERGES ON CLUSTER '$CLUSTER' \`$DATABASE\`.\`$LOCAL_TABLE_CHAMELEON\`" --echo;
+)}
+
+function r_StartTTLMerges()
+{(
+    set -e;
+    s_WaitOnBusyDistributedDDLQueue 0;
+    kube_chc_query "SYSTEM STOP TTL MERGES ON CLUSTER '$CLUSTER' \`$DATABASE\`.\`$LOCAL_TABLE_DT\`" --echo;
+    kube_chc_query "SYSTEM STOP TTL MERGES ON CLUSTER '$CLUSTER' \`$DATABASE\`.\`$LOCAL_TABLE_CHAMELEON\`" --echo;
+)}
+
+function s_StopMerges()
+{(
+    set -e;
+    s_WaitOnBusyDistributedDDLQueue 0;
+    kube_chc_query "SYSTEM STOP MERGES ON CLUSTER '$CLUSTER' \`$DATABASE\`.\`$LOCAL_TABLE_DT\`" --echo;
+    kube_chc_query "SYSTEM STOP MERGES ON CLUSTER '$CLUSTER' \`$DATABASE\`.\`$LOCAL_TABLE_CHAMELEON\`" --echo;
+)}
+
+function r_StopMerges()
+{(
+    set -e;
+    s_WaitOnBusyDistributedDDLQueue 0;
+    kube_chc_query "SYSTEM START MERGES ON CLUSTER '$CLUSTER' \`$DATABASE\`.\`$LOCAL_TABLE_DT\`" --echo;
+    kube_chc_query "SYSTEM START MERGES ON CLUSTER '$CLUSTER' \`$DATABASE\`.\`$LOCAL_TABLE_CHAMELEON\`" --echo;
+)}
+
+function get_replicated_server_pods()
+{
+    local -a server_pods=( ${SERVER_PODS[@]} )
+    # For replicated tables, target replica 0 of each shard
+    if [[ "$ENGINE_REPLICATED" == true && "$REPLICATED_ALL_REPLICAS" != true ]]; then
+        server_pods=( $(IFS=$'\n'; echo "${SERVER_PODS[*]}" | grep -e '-0-0$') )
+    fi
+    (IFS=$'\n'; echo "${server_pods[*]}")
+}
+
+function s_PreMigrateData()
+{
+    declare -gA \
+        STATE_MigrateData_POD_SCRIPTS=() \
+        STATE_MigrateData_SCRIPTS_COMPLETED=()
+
+    local dst_table="\`$DATABASE\`.\`$LOCAL_TABLE_DT\`" src_table="\`$DATABASE\`.\`$LOCAL_TABLE_CHAMELEON\`"
+    local datetime_column=$STATE_MigrateData_DATETIME_COLUMN interval=${STATE_MigrateData_TIMESLOT_INTERVAL:-'4 HOUR'}
+    local -u direction=${STATE_MigrateData_DIRECTION:-'DESC'}
+
+    local concurrency=${STATE_MigrateData_CONCURRENCY:-'1'} mode=${STATE_MigrateData_CONCURRENCY_MODE:-'PROCESS'};
+
+    if (( concurrency <= 0 )); then
+        log_state_error "Variable 'STATE_MigrateData_CONCURRENCY' should be a positive integer, got $STATE_MigrateData_CONCURRENCY";
+        pause; return 1;
+    fi
+    if ! [[ "$mode" =~ ^('PROCESS'|'THREAD')$ ]]; then
+        log_state_error "Variable 'STATE_MigrateData_CONCURRENCY_MODE' should be 'PROCESS' or 'THREAD', got '$STATE_MigrateData_CONCURRENCY_MODE'";
+        pause false; return 2;
+    fi
+    if ! [[ "$direction" =~ ^('ASC'|'DESC')$ ]]; then
+        log_state_error "Variable 'STATE_MigrateData_DIRECTION' should be 'ASC' or 'DESC', got '$STATE_MigrateData_DIRECTION'";
+        pause false; return 2;
+    fi
+
+    RELOAD=true;
+    (
+        set -e;
+        r_PreMigrateData;
+        log_state_info "Generating 'INSERT INTO $dst_table SELECT * FROM $src_table' queries..."
+
+        local -a server_pods=( $(get_replicated_server_pods) )
+
+        trap_kill_group;
+
+        local pids='';
+        for pod in ${server_pods[@]}; do
+            ./for_each_line2.sh --log-level $LOG_LEVEL \
+                --file "$DIR/dt.$pod.sql" --pod $pod \
+                --chc "${CHC_FLAGS[*]}" \
+                --templated-generator preview insert_select_with_columns_by_timeslot \
+                "dst_table=$dst_table,src_table=$src_table,datetime_column=$datetime_column,interval=$interval,direction=$direction" 2> >(last_error >&2) &
+            pids+=" $!"
+        done
+        for pid in $pids; do wait $pid; done
+        trap_restore_kill_group;
+
+        log_state_info "Wrote files '$RELATIVE_DIR/dt.*.sql'"
+
+        if [ $mode == 'PROCESS' ] && [ $concurrency != 1 ]; then
+            set_chc_params true --max_threads=1 --max_insert_threads=1
+        else
+            set_chc_params true --max_threads=$concurrency --max_insert_threads=$concurrency
+        fi
+
+        for pod in ${server_pods[@]}; do
+            local f="$DIR/dt.$pod.sql"
+            if [ $mode == 'PROCESS' ] && [ $concurrency != 1 ]; then
+                if ! [ -f "$f" ]; then log_state_error "File disappeared: $f."; return 1; fi
+                # Split file: $f --> $f.splitted.01, $f.splitted.02 ...
+                (cd $DIR; awk -v prefix=$f -v concurrency=$concurrency '{ file=sprintf("%s.splitted.%02d.sql", prefix, NR % concurrency + 1); print > file }' $f)
+                STATE_MigrateData_POD_SCRIPTS[$pod]=$(ls $f.splitted.*.sql | tr '\n' ' ')
+            else
+                STATE_MigrateData_POD_SCRIPTS[$pod]=$f
+            fi
+        done
+        log_state_debug "Gathered task files: ${NC}\n$(IFS=$'\n'; echo "${STATE_MigrateData_POD_SCRIPTS[*]}")";
+        store '' '' ''; # Commit variable STATE_MigrateData_POD_SCRIPTS
+    )
+}
+
+function r_PreMigrateData() { (cd $DIR; rm -rf dt.*.sql dt.*.sql.splitted.* dt.*.state) }
+
+function s_MigrateData()
+{
+    RELOAD=true;
+(
+    set -e;
+
+    if [ ! -f './for_each_line2.sh' ] && ! command -v for_each_line2.sh >/dev/null; then
+        log_state_error "Not found script for_each_line2.sh";
+        pause;
+        return 1;
+    fi
+    log_state_info "Got task files: ${NC}\n$(IFS=$'\n'; echo "${STATE_MigrateData_POD_SCRIPTS[*]}")"
+
+    trap_kill_group true; # Fine if the trap not restored
+
+    local -A script_pids=()
+
+    while true; do
+        local all_completed=true;
+        for pod in ${!STATE_MigrateData_POD_SCRIPTS[@]}; do
+            for script in ${STATE_MigrateData_POD_SCRIPTS[$pod]}; do
+                if [ "${STATE_MigrateData_SCRIPTS_COMPLETED[$script]}" == true ]; then continue; fi
+                local pid=${script_pids[$script]}
+                # Process not spawned or has stopped.
+                if [[ -z "$pid" || ! -e /proc/$pid ]]; then
+                    if [ -z "$pid" ]; then
+                        log_state_info "Spawning for_each_line2.sh with script '$script'"
+                    else
+                        if wait $pid; then
+                            log_state_info "Script '$script' has been completed. Last process PID $pid"
+                            STATE_MigrateData_SCRIPTS_COMPLETED[$script]=true;
+                            store '' '' '';
+                            continue;
+                        else
+                            log_state_warn "Process (PID $pid) of script '$script' exited with code $?, respawning it."
+                        fi
+                    fi
+                    if s_CheckTablesNotReadOnly $LOCAL_TABLE_DT; then # Check before insert.
+
+                        ./for_each_line2.sh --log-level $LOG_LEVEL \
+                            --file "$script" --pod $pod \
+                            --dsh insert_select_delete_where --ech '241 call insert_select_delete_where' "${ECH_FLAGS[@]}" --chc "${CHC_FLAGS[*]}" \
+                            &
+                        script_pids[$script]=$!
+                    else
+                        log_error "Table \`$LOCAL_TABLE_DT\` is readonly on replica $pod"
+                    fi
+                else
+                    : # Process still running
+                fi
+                all_completed=false;
+            done
+        done
+        if [ $all_completed == true ]; then
+            log_state_info "All data migration tasks completed."
+            break;
+        else
+            sleep 10;
+        fi
+    done
+    trap_restore_kill_group;
+)}
+
+function c_MigrateData()
+{
+    log_state_info "Not cleaning the state here, leave the work to 'for_each_line2.sh'";
+}
+
+function r_MigrateData()
+{(
+    set -e;
+    # truncate table
+    create_flag_file force_drop_table;
+
+    LOG_PREFIX=true kube_chc_query_all "ATTACH TABLE IF NOT EXISTS \`$DATABASE\`.\`$LOCAL_TABLE_DT\`" --echo; # In case of retry.
+
+    LOG_PREFIX=true kube_chc_query_all "
+        KILL MUTATION WHERE is_done=0 AND database='$DATABASE' AND table='$LOCAL_TABLE_DT' SYNC;
+        KILL QUERY WHERE like(query,'%$DATABASE%') AND like(query,'%$LOCAL_TABLE_DT%') SYNC;
+        TRUNCATE TABLE \`$DATABASE\`.\`$LOCAL_TABLE_DT\` SYNC;
+        " --echo -n;
+
+    LOG_PREFIX=true kube_chc_query_all "
+        DETACH TABLE \`$DATABASE\`.\`$LOCAL_TABLE_DT\` SYNC;
+        KILL QUERY WHERE like(query,'%$DATABASE%') AND like(query,'%$LOCAL_TABLE_DT%') SYNC;
+        ATTACH TABLE \`$DATABASE\`.\`$LOCAL_TABLE_DT\`" --echo -n;
+
+    delete_flag_file force_drop_table;
+
+    rm -rf $DIR/dt.*.state;
+    flock -x $DIR/state echo "declare -gA STATE_MigrateData_SCRIPTS_COMPLETED=()" >> $DIR/state.override
+)}
+
+function create_or_delete_flag_file()
+{(
+    set -e;
+    local create=$1 file=$2 pids='';
+    trap_kill_group;
+
+    for pod in ${SERVER_PODS[@]}; do
+        if [ "$create" == true ]; then
+            $KUBECTL exec $pod -- touch /var/lib/clickhouse/flags/$file &
+        else
+            $KUBECTL exec $pod -- rm -rf /var/lib/clickhouse/flags/$file &
+        fi
+        pids+=" $!"
+    done
+    for pid in $pids; do wait $pid; done
+    trap_restore_kill_group;
+)}
+
+function create_flag_file() { create_or_delete_flag_file true $1; }
+function delete_flag_file() { create_or_delete_flag_file false $1; }
+
+function unindent()
+{
+    local text=$1
+    local indent=$(sed -nr '/^ +/{s|^( +)[^ ].*$|\1|p}' <<<"$text" | head -1)
+    sed -r "s|^$indent||g" <<<"$text"
+}
+
+function indent() { local pad=$(printf '%*s' ${1:-'4'}); sed "s|^|$pad|g"; }
+
+function folded_indent()
+{
+    [ -z "$COLUMNS" ] && { LINES=$(tput lines || echo 40) COLUMNS=$(tput cols || echo 200); }
+    local indentation=${1:-'4'};
+    fold -s -w $((COLUMNS-indentation)) | indent $indentation;
+}
+
+function s_ConsistencyReport()
+{(
+    set -e;
+    # report data consistency
+    local datetime_column=$STATE_MigrateData_DATETIME_COLUMN interval=${STATE_ConsistencyReport_TIMESLOT_INTERVAL:-${STATE_MigrateData_TIMESLOT_INTERVAL:-'4 HOUR'}}
+    local res1 res2
+
+    res1=$(kube_chc_query "
+        WITH
+            (SELECT count() FROM clusterAllReplicas('$CLUSTER','$DATABASE','$LOCAL_TABLE_DT')) AS count_dt,
+            (SELECT count() FROM clusterAllReplicas('$CLUSTER','$DATABASE','$LOCAL_TABLE_CHAMELEON')) AS count_chameleon
+        SELECT
+            count_dt AS \`DT Table\`, count_chameleon AS \`Chameleon Table\`,
+            count_chameleon - count_dt AS Diff, round(Diff * 100 / count_chameleon, 5) AS \`Diff %\`
+    " --format PrettyCompactMonoBlock)
+
+    res2=$(kube_chc_query "
+        SELECT
+            time_slot AS \`Time Slot\`, host AS Host, l.count AS \`DT Table\`, r.count AS \`Chameleon Table\`,
+            r.count - l.count AS Diff, round(Diff * 100 / r.count, 5) AS \`Diff %\`
+        FROM
+        (
+            SELECT hostname() AS host, toStartOfInterval($datetime_column, INTERVAL $interval) AS time_slot, count() AS count
+            FROM clusterAllReplicas('$CLUSTER','$DATABASE','$LOCAL_TABLE_DT')
+            GROUP BY host, time_slot
+        ) AS l
+        FULL OUTER JOIN
+        (
+            SELECT hostname() AS host, toStartOfInterval($datetime_column, INTERVAL $interval) AS time_slot, count() AS count
+            FROM clusterAllReplicas('$CLUSTER','$DATABASE','$LOCAL_TABLE_CHAMELEON')
+            GROUP BY host, time_slot
+        ) AS r USING (host, time_slot)
+        WHERE abs(Diff) > 0
+        ORDER BY time_slot, host
+    " --format PrettyCompactMonoBlock)
+
+    local consistent=false
+    if [ -z "$res2" ]; then
+        local count_dt count_chameleon diff
+        read count_dt count_chameleon diff _ <<<"$(index_line 2 "$res1" | tr -d │)"
+        if [[ -n "$count_dt" && -n "$count_chameleon" && -n "$diff" && "$count_dt" == "$count_chameleon" && "$diff" == '0' ]]; then
+            consistent=true
+        fi
+    fi
+
+    local res;
+    if [ $consistent == true ]; then
+        res="Data is consistent between tables \`$DATABASE\`.\`$LOCAL_TABLE_DT\` and \`$DATABASE\`.\`$LOCAL_TABLE_CHAMELEON\`."
+        res="$res\n\nSummary:\n$res1"
+    else
+        res="Data is NOT consistent between tables \`$DATABASE\`.\`$LOCAL_TABLE_DT\` and \`$DATABASE\`.\`$LOCAL_TABLE_CHAMELEON\`."
+        res="$res\n\nRun \`set $RELATIVE_DIR STATE=MigrateData REVERT=state PAUSED=false\` to revert the data migration state, if needed, before proceeding to next states."
+        if [ "$ENGINE_DEDUPLICATING" == true ]; then
+            res="$res\n\nNote: This can be normal for Replacing|Summing|Aggregating|VersionedCollapsing MergeTree tables."
+            res="$res  \n      Run query 'OPTIMIZE TABLE \`$DATABASE\`.\`$LOCAL_TABLE_CHAMELEON\` FINAL' on ClickHouse servers (at your own risk),"
+            res="$res  \n      then \`revert $RELATIVE_DIR\` and repeat \`walk_state $RELATIVE_DIR\` twice to re-generate the consistency report."
+        fi
+        res="$res\n\nSummary:\n$res1"
+        res="$res\nBy time slots:\n$res2"
+    fi
+    echo -e "$res\n$(datetime_ms) @ $(hostname -f)" > $DIR/consistency_report
+
+    log_state_info "Wrote consistency report to '$RELATIVE_DIR/consistency_report':$RST\n$res"
+)}
+
+function r_ConsistencyReport() { rm -rf $DIR/consistency_report; }
+
+function s_CopyDDLProjectionsAndIndexes()
+{(
+    set -e;
+    local ddl_on_cluster
+    ddl_on_cluster=$(get_ddl_indexes_and_projections ADD false true)
+
+    if [ -z "$ddl_on_cluster" ]; then return 0; fi
+
+    s_WaitOnBusyDistributedDDLQueue 0;
+    kube_chc_query "$ddl_on_cluster" --echo;
+)}
+
+function r_CopyDDLProjectionsAndIndexes()
+{(
+    set -e;
+    local ddl
+    ddl=$(get_ddl_indexes_and_projections DROP true false)
+
+    if [ -z "$ddl" ]; then return 0; fi
+
+    s_WaitOnBusyDistributedDDLQueue 0; # Wait DDL from 's_CopyDDLProjectionsAndIndexes' actually applied to all replicas
+    LOG_PREFIX=true kube_chc_query_all "KILL MUTATION WHERE is_done=0 AND database='$DATABASE' AND table='$LOCAL_TABLE_DT' SYNC";
+    (
+        SERVER_PODS=( $(get_replicated_server_pods) );
+        LOG_PREFIX=true kube_chc_query_all "$ddl SETTINGS alter_sync=2,mutations_sync=2";
+    )
+)}
+
+function check_busy_replicated_event()
+{(
+    set -e;
+    local table=${1:?} event=${2:?} threshold=${3:?};
+
+    if [ "$ENGINE_REPLICATED" == false ]; then return 0; fi
+
+    log_state_info "Checking if there are busy replicated $event on table \`$DATABASE\`.\`$table\`"
+    local count
+    count=$(kube_chc_query "SELECT count() FROM clusterAllReplicas('$CLUSTER',system.replication_queue) WHERE database='$DATABASE' AND table='$table' AND type='$event'");
+    (( count <= threshold ));
+)}
+
+function check_busy_replicated_fetches() { check_busy_replicated_event ${1:-$LOCAL_TABLE_CHAMELEON} 'GET_PART' ${STATE_WaitBusyReplicatedFetches_THRESHOLD:-0}; }
+
+function check_busy_replicated_merges() { check_busy_replicated_event ${1:-$LOCAL_TABLE_CHAMELEON} 'MERGE_PARTS' ${STATE_WaitBusyReplicatedMerges_THRESHOLD:-0}; }
+
+function check_busy_merges()
+{(
+    set -e;
+    local threshold=${STATE_WaitBusyMerges_THRESHOLD:-0};
+
+    log_state_info "Checking if there are busy merges on table \`$DATABASE\`.\`$LOCAL_TABLE_DT\`"
+
+    local count
+    count=$(kube_chc_query "SELECT count() FROM clusterAllReplicas('$CLUSTER',system.merges) WHERE database='$DATABASE' AND table='$LOCAL_TABLE_DT'");
+    (( count <= threshold ));
+)}
+
+function r_WaitBusyMerges() { return 0; }
+
+function check_parts_stable()
+{
+    local table=${1:?};
+    RELOAD=true;
+(
+    set -e;
+    check_busy_merges;
+    check_busy_replicated_fetches $table;
+    check_busy_replicated_merges $table;
+    if ((STATE_WaitPartsStable_INTERVAL == 0)); then return 0; fi
+
+    local threshold=${STATE_WaitPartsStable_STABLE_THRESHOLD:-1};
+    local interval=$STATE_WaitPartsStable_INTERVAL;
+
+    log_state_info "Checking if number of parts has stabilized in table \`$DATABASE\`.\`$table\`."
+
+    local ret=0 number_of_parts
+    number_of_parts=$(kube_chc_query "SELECT count() FROM clusterAllReplicas('$CLUSTER',system.parts) WHERE active AND database='$DATABASE' AND table='$table'")
+
+    if ((STATE_WaitPartsStable_LAST_NUMBER_OF_PARTS == 0)); then # First time
+        STATE_WaitPartsStable_LAST_NUMBER_OF_PARTS=$number_of_parts;
+        ret=1;
+    else
+        if ((STATE_WaitPartsStable_LAST_NUMBER_OF_PARTS - number_of_parts >= threshold)) \
+            || ((number_of_parts - STATE_WaitPartsStable_LAST_NUMBER_OF_PARTS >= threshold)); then # Still increasing ?
+            log_state_info "Sleeping for $interval seconds..."
+            STATE_WaitPartsStable_LAST_NUMBER_OF_PARTS=$number_of_parts;
+            ret=1;
+        else
+            STATE_WaitPartsStable_LAST_NUMBER_OF_PARTS=0;
+            log_state_info "Yes, it's stable."
+        fi
+    fi
+    store '' '' '';
+    sleep $interval
+    return $ret;
+)}
+
+function s_WaitPartsStableChameleon()
+{
+    while ! check_parts_stable $LOCAL_TABLE_CHAMELEON; do
+        log_state_warn "Found active merges/fetches on table \`$1\`. Will wait and re-check later."
+        sleep 10;
+    done
+}
+
+function r_WaitPartsStableChameleon() { return 0; }
+
+function s_WaitPartsStableDT()
+{
+    while ! check_parts_stable $LOCAL_TABLE_DT; do
+        log_state_warn "Found active merges/fetches on table \`$1\`. Will wait and re-check later."
+        sleep 10;
+    done
+}
+
+function r_WaitPartsStableDT() { return 0; }
+
+function check_busy_mutations_on_table()
+{(
+    set -e;
+    local table=$1;
+    log_state_info "Checking if there are busy mutations on table \`$DATABASE\`.\`$table\`"
+
+    local res
+    res=$(kube_chc_query "SELECT create_time,database,table,command,mutation_id,parts_to_do,is_done,latest_fail_reason FROM clusterAllReplicas('$CLUSTER',system.mutations) WHERE database='$DATABASE' AND table='$table' AND is_done=0 FORMAT PrettyCompactMonoBlock");
+
+    if [ -n "$res" ]; then log_info "\n$res"; return 1; fi
+)}
+
+function s_WaitOnBusyMutationsOnTable()
+{
+    while ! check_busy_mutations_on_table $1; do
+        log_state_warn "Found active mutations on table \`$1\`. Will wait and re-check later."
+        sleep 10;
+    done
+}
+
+function r_WaitOnBusyMutationsOnTable() { return 0; }
+
+function s_MaterializeProjectionsAndIndexes()
+{(
+    set -e;
+    local ddl_on_cluster
+    ddl_on_cluster=$(get_ddl_indexes_and_projections MATERIALIZE false true)
+
+    if [ -z "$ddl_on_cluster" ]; then return 0; fi
+
+    s_WaitOnBusyMutationsOnTable $LOCAL_TABLE_DT;
+    log_state_info "Materializing indexes and projections..."
+
+    kube_chc_query "$ddl_on_cluster" --echo;
+)}
+
+function r_MaterializeProjectionsAndIndexes(){ return 0; } # We can do re-materialization, so no need to revert anything.
+
+function s_WaitMaterializationDone()
+{(
+    set -e;
+    log_state_info "Checking if materialization of indexes and projections is done..."
+    local interval=${STATE_WaitMaterializationDone_INTERVAL:-10}
+
+    local res1 query1="SELECT count() FROM clusterAllReplicas('$CLUSTER',system.mutations) WHERE is_done=0 AND database='$DATABASE' AND table='$LOCAL_TABLE_DT'"
+    local res2 query2="SELECT count() FROM clusterAllReplicas('$CLUSTER',system.mutations) WHERE is_done=0 AND database='$DATABASE' AND table='$LOCAL_TABLE_DT' AND latest_fail_reason!=''"
+
+    res1=$(kube_chc_query "$query1")
+    if [ "$res1" != '0' ]; then
+        res2=$(kube_chc_query "$query2")
+        if ((res2 > 0)); then
+            log_state_error "There are mutation errors. Please have a check." # Not likely, just in case.
+            pause false;
+            return 1;
+        fi
+        log_state_info "Sleeping for $interval seconds..."
+        sleep $interval
+        return 1;
+    else
+        log_state_info "Yes, it's all done."
+        return 0
+    fi
+)}
+
+function r_WaitMaterializationDone() { return 0; }
+
+function s_RedirectMergedView()
+{(
+    set -e;
+    s_WaitOnBusyDistributedDDLQueue 0;
+    log_state_info "Redirecting Merge view to point to $LOCAL_TABLE and $LOCAL_TABLE_DT";
+    kube_chc_query "$DDL_ON_CLUSTER_MERGE_DT" --echo;
+)}
+
+function r_RedirectMergedView()
+{(
+    set -e;
+    s_WaitOnBusyDistributedDDLQueue 0;
+    kube_chc_query "$DDL_ON_CLUSTER_MERGE_CHAMELEON" --echo;
+)}
+
+function s_PreMovePartitions()
+{
+    declare -gA \
+        STATE_MovePartitions_POD_SCRIPTS=() \
+        STATE_MovePartitions_SCRIPTS_COMPLETED=()
+
+    local concurrency=${STATE_MovePartitions_CONCURRENCY:-'1'}
+    local -u direction=${STATE_MovePartitions_DIRECTION:-'ASC'}
+
+    if (( concurrency <= 0 )); then
+        log_state_error "Variable 'STATE_MovePartitions_CONCURRENCY' should be a positive integer, got $STATE_MovePartitions_CONCURRENCY";
+        pause false; return 2;
+    fi
+    if ! [[ "$direction" =~ ^('ASC'|'DESC')$ ]]; then
+        log_state_error "Variable 'STATE_MovePartitions_DIRECTION' should be 'ASC' or 'DESC', got '$STATE_MovePartitions_DIRECTION'";
+        pause false; return 2;
+    fi
+
+    RELOAD=true;
+    (
+        set -e;
+        r_PreMovePartitions;
+
+        local query="
+            SELECT concat('ALTER TABLE \`$DATABASE\`.\`$LOCAL_TABLE_DT\` MOVE PARTITION ID \'',partition_id,'\' TO TABLE \`$DATABASE\`.\`$LOCAL_TABLE\`; -- Partition ', partition)
+            FROM (
+                SELECT database,table,partition,partition_id
+                FROM system.parts
+                WHERE active AND (database = '$DATABASE') AND (table = '$LOCAL_TABLE_DT')
+                GROUP BY database,table,partition,partition_id
+                ORDER BY database ASC,table ASC,partition $direction
+            )
+            FORMAT TSVRaw"
+
+        local -a server_pods=( $(get_replicated_server_pods) )
+
+        local pids='';
+        trap_kill_group;
+        for pod in ${server_pods[@]}; do
+            kube_ch $pod clickhouse-client "$query" "${CHC_FLAGS[@]}" > $DIR/move.$pod.sql &
+            pids+=" $!"
+        done
+        for pid in $pids; do wait $pid; done
+        trap_restore_kill_group;
+
+        log_state_info "Wrote files '$RELATIVE_DIR/move.*.sql'"
+
+        for pod in ${server_pods[@]}; do
+            local f="$DIR/move.$pod.sql"
+            if [ $concurrency != 1 ]; then
+                if ! [ -f "$f" ]; then log_state_warn "File disappeared: '$f'."; return 1; fi
+                # Split file: $f --> $f.splitted.01, $f.splitted.02 ...
+                (cd $DIR; awk -v prefix=$f -v concurrency=$concurrency '{ file=sprintf("%s.splitted.%02d.sql", prefix, NR % concurrency + 1); print > file }' $f)
+                STATE_MovePartitions_POD_SCRIPTS[$pod]=$(ls $f.splitted.*.sql | tr '\n' ' ')
+            else
+                STATE_MovePartitions_POD_SCRIPTS[$pod]=$f
+            fi
+        done
+        log_state_debug "Gathered task files: ${STATE_MovePartitions_POD_SCRIPTS[*]}";
+        store '' '' ''; # Commit variable STATE_MovePartitions_POD_SCRIPTS
+    )
+}
+
+function r_PreMovePartitions()
+{
+    (cd $DIR; rm -rf move.*.sql move.*.sql.splitted.* move.*.state)
+    unset STATE_MovePartitions_POD_SCRIPTS STATE_MovePartitions_SCRIPTS_COMPLETED;
+    declare -gA \
+        STATE_MovePartitions_POD_SCRIPTS=() \
+        STATE_MovePartitions_SCRIPTS_COMPLETED=()
+}
+
+# TODO: deduplicate the code
+function s_MovePartitions()
+{
+    RELOAD=true;
+(
+    set -e;
+    s_CheckTablesNotReadOnly $LOCAL_TABLE $LOCAL_TABLE_DT;
+    # Check if there are same partitions between $LOCAL_TABLE and $LOCAL_TABLE_DT
+    # Because we cannot stop merges on $LOCAL_TABLE.
+    # if [ -z "$STATE_MovePartitions_TABLES_PARTITION_OVERLAPPED" ]; then
+    #     local res query="SELECT count()
+    #         FROM
+    #         (
+    #             SELECT DISTINCT partition FROM clusterAllReplicas('$CLUSTER',system.parts) WHERE active AND database='$DATABASE' AND table='$LOCAL_TABLE'
+    #         ) AS l
+    #         INNER JOIN
+    #         (
+    #             SELECT DISTINCT partition FROM clusterAllReplicas('$CLUSTER',system.parts) WHERE active AND database='$DATABASE' AND table='$LOCAL_TABLE_DT'
+    #         ) AS r USING (partition)"
+
+    #     res=$(kube_chc_query "$query")
+    #     if [ "$res" == '0' ]; then
+    #         STATE_MovePartitions_TABLES_PARTITION_OVERLAPPED=false;
+    #     else
+    #         STATE_MovePartitions_TABLES_PARTITION_OVERLAPPED=true;
+    #         log_state_warn "There are some same partitions between tables $LOCAL_TABLE and $LOCAL_TABLE_DT, reverting is not possible."
+    #     fi
+    # fi
+    log_warn "State MovePartitions and afer can not be reverted (not implemented)."
+
+    set -e;
+    if [ ! -f './for_each_line2.sh' ] && ! command -v for_each_line2.sh >/dev/null; then
+        log_state_error "Not found script for_each_line2.sh";
+        pause false; return 1;
+    fi
+    log_state_info "Got task files: ${STATE_MovePartitions_POD_SCRIPTS[*]}"
+
+    trap_kill_group true;
+
+    local -A script_pids=()
+    while true; do
+        local all_completed=true;
+        for pod in ${!STATE_MovePartitions_POD_SCRIPTS[@]}; do
+            for script in ${STATE_MovePartitions_POD_SCRIPTS[$pod]}; do
+                if [ "${STATE_MovePartitions_SCRIPTS_COMPLETED[$script]}" == true ]; then continue; fi
+                local pid=${script_pids[$script]}
+                # Process not spawned or has stopped.
+                if [[ -z "$pid" || ! -e /proc/$pid ]]; then
+                    if [ -z "$pid" ]; then
+                        log_state_info "Spawning for_each_line2.sh with script '$script'"
+                    else
+                        if wait $pid; then
+                            log_state_info "Script '$script' has been completed. Last process PID $pid"
+                            STATE_MovePartitions_SCRIPTS_COMPLETED[$script]=true;
+                            store '' '' '';
+                            continue;
+                        else
+                            log_state_warn "Process (PID $pid) of script '$script' exited with code $?, respawning it."
+                        fi
+                    fi
+                    ./for_each_line2.sh --log-level $LOG_LEVEL \
+                        --file "$script" --pod $pod \
+                        "${ECH_FLAGS[@]}" --chc "${CHC_FLAGS[*]}" &
+                    script_pids[$script]=$!
+                else
+                    : # Process still running
+                fi
+                all_completed=false;
+            done
+        done
+        if [ $all_completed == true ]; then
+            log_state_info "All data migration tasks completed."
+            break;
+        else
+            sleep 10;
+        fi
+    done
+    trap_restore_kill_group;
+
+    log_state_info "Double checking if there is any data left behind in table \`$LOCAL_TABLE_DT\`"
+    local res
+    res=$(kube_chc_query "SELECT count() FROM clusterAllReplicas('$CLUSTER','$DATABASE','$LOCAL_TABLE_DT')")
+    if [ "$res" != '0' ]; then
+        log_state_error "There are still some data left in table '$LOCAL_TABLE_DT', will rewind to state 'PreMovePartitions'."
+        RELOCATE=true;
+        store PreMovePartitions true false;
+        return 1
+    fi
+)}
+
+# Always retry MovePartitions
+# `ALTER TABLE MOVE PARTITION` is safely retryable.
+function c_MovePartitions() { return 0; }
+
+function r_MovePartitions()
+{
+    # if [ "$STATE_MovePartitions_TABLES_PARTITION_OVERLAPPED" == false ]; then # can be reverted
+    #     STATE_MovePartitions_MOVED_PARTITIONS
+    # else
+    #     pause;
+    #     log_state_error "Can not revert MovePartitions, because partitions overlapped between tables $LOCAL_TABLE and $LOCAL_TABLE_DT (before MovePartitions). State paused."
+    #     return 1;
+    # fi
+    # TODO allow revert if no partition intersection, with acknowledgement from the user
+    log_state_error "State MovePartitions can not be reverted. Paused."
+    pause false;
+    exit 1; # Yes! Halt the machine!
+}
+
+function s_RestoreDistributedView()
+{(
+    set -e;
+    s_WaitOnBusyDistributedDDLQueue 0;
+    kube_chc_query "$DDL_ON_CLUSTER_DISTRIBUTED" --echo;
+)}
+
+# 'CREATE OR REPLACE' is safely retryable.
+function c_RestoreDistributedView() { return 0; }
+
+function r_RestoreDistributedView()
+{(
+    set -e;
+    s_WaitOnBusyDistributedDDLQueue 0;
+    kube_chc_query "$DDL_ON_CLUSTER_DISTRIBUTED_MERGED" --echo;
+)}
+
+function consistent()
+{
+    if [ -f "$DIR/consistency_report" ]; then
+        if head -1 $DIR/consistency_report | grep -q '^Data is consistent'; then
+            return 0;
+        else
+            return 1;
+        fi
+    else
+        log_error "File does not exist: '$DIR/consistency_report', this is unexpected."
+        exit 2;
+    fi
+}
+
+function s_DropTables()
+{(
+    set -e;
+    LOG_PREFIX=true kube_chc_query_all "DROP TABLE IF EXISTS \`$DATABASE\`.\`$LOCAL_TABLE_MERGED\` SYNC" --echo;
+    LOG_PREFIX=true kube_chc_query_all "DROP TABLE IF EXISTS \`$DATABASE\`.\`$LOCAL_TABLE_DT\` SYNC" --echo;
+
+    log_state_info "Dropped helper tables: \`$LOCAL_TABLE_DT\`, \`$LOCAL_TABLE_MERGED\`";
+
+    local should_drop_old_table=false
+
+    if [ "$STATE_DropTables_DROP_OLD_TABLE" == true ]; then # User specified
+        should_drop_old_table=true;
+    elif [ "$STATE_DropTables_DROP_OLD_TABLE_IF_CONSISTENT" == true ]; then
+        if [ -f "$DIR/consistency_report" ] && consistent; then
+            should_drop_old_table=true;
+        fi
+    fi
+    if [ $should_drop_old_table == true ]; then
+        log_state_info "Will drop the old table: \`$LOCAL_TABLE_CHAMELEON\`. Please be patient, it may take some time."
+
+        create_flag_file force_drop_table;
+        LOG_PREFIX=true kube_chc_query_all "DROP TABLE IF EXISTS \`$DATABASE\`.\`$LOCAL_TABLE_CHAMELEON\` SYNC" --echo;
+        delete_flag_file force_drop_table;
+    fi
+)}
+
+function c_DropTables() { return 0; }
+
+# function r_DropTables() # No revert
+
+function s_Complete()
+{
+    log_info "Achieved completed state, exiting."
+    set_dirty false;
+    exit 0;
+}
+
+function s_Pause() { STATE=$(get_next_state); RELOAD=true; RELOCATE=true; pause false; return 0; }
+function r_Pause() { return 0; }
+
+function s_Pause_IfNotConsistent() { if ! consistent; then s_Pause; else return 0; fi; }
+function r_Pause_IfNotConsistent() { return 0; }
+
+function dir_is_root()
+{
+    local dir=${1:-$DIR} ret=0
+    if [ -f "$dir" ]; then # regular file
+        ret=1;
+    elif [ -d "$dir" ]; then # directory
+        [ $(realpath "$dir") == '/' ]; ret=$?
+    else
+        [ $(realpath -m "$dir") == '/' ]; ret=$?
+    fi
+    return $ret;
+}
+
+function s_Pause_ForLazy()
+{
+    (
+        # Backup the task directory
+        set -e;
+        local backup_dir backup_name
+        backup_dir=$(realpath $DIR/../)
+        backup_name="$(basename $DIR).$(date +'%Y-%m-%d_%H%M%S').tar"
+
+        if [ -n "$STATE_Pause_ForLazy_BACKUP_DIR" ]; then
+            if dir_is_root "$STATE_Pause_ForLazy_BACKUP_DIR"; then
+                log_warn "Refusing to use root directory, given STATE_Pause_ForLazy_BACKUP_DIR=$STATE_Pause_ForLazy_BACKUP_DIR. Will fall back to default."
+            else
+                backup_dir=$STATE_Pause_ForLazy_BACKUP_DIR;
+            fi
+        fi
+        store '' '' '';
+        tar -cf $backup_dir/$backup_name $DIR;
+        s_Pause
+    ) && exit 0;
+}
+
+function r_Pause_ForLazy() { return 0; }
+
+function func_defined() { declare -F "$1" >/dev/null; }
+
+function lock_dir_100_or_exit()
+{
+    if [ -e /proc/$$/fd/100 ]; then
+        log_error "Logical error: file discriptor 100 is already in use.";
+        exit 2;
+    fi
+    exec 100< $DIR # open
+
+    local ret
+    flock -E 249 -xn 100; ret=$?
+
+    if [ $ret != 0 ]; then
+        if [ $ret == 249 ]; then
+            log_error "Unable to lock task directory '$RELATIVE_DIR', maybe another instance is running ?";
+        fi
+        exit 1;
+    fi
+}
+
+function unlock_dir_100()
+{
+    if ! [ -e /proc/$$/fd/100 ]; then
+        log_error "Logical error: file discriptor 100 is not opened.";
+        exit 2;
+    fi
+    exec 100<&-;
+}
+
+function last_error()
+{(
+    set +x;
+    local truncated=false;
+    while read -r; do
+        if [ "$truncated" == false ]; then truncate -s0 $DIR/last_error; truncated=true; fi
+        echo "$REPLY" | tee -a $DIR/last_error;
+    done
+)}
+
+function walk_state_unlocked()
+{
+    if ! func_defined "r_${STATE}"; then
+        log_warn "Revert function for state '$STATE' not found. Reverting is not possible.";
+    fi
+
+    local ret='' state=$STATE next_state=$STATE;
+
+    if [ -n "$REVERT" ]; then # Reverting
+        log_info "Reverting state '$state'"
+        unset STATES_START_TIME[$state] STATES_FINISH_TIME[$state];
+
+        set_dirty true; # Keep it true if reverting.
+        r_${state}; ret=$?
+
+        if [[ "$RELOAD" == true || "$RELOCATE" == true ]]; then load; RELOAD=false; fi
+        if [ $ret != 0 ]; then
+            log_warn "Code $ret, failed to revert state '$state'. Retrying."
+        else
+            if [[ "$REVERT" != "$state" ]]; then
+                next_state=$(get_previous_state) # Continue to revert 'all'
+            else
+                log_info "Reverted to the begining of state $state.";
+                REVERT=''; DIRTY=false;
+                pause;
+            fi
+        fi;
+    elif [ "$DIRTY" == true ]; then # Cleaning
+        log_info "State '$state' dirty, cleaning"
+
+        if func_defined "c_${state}"; then
+            c_${state}; ret=$?
+        elif func_defined "r_${state}"; then
+            r_${state}; ret=$?
+        else
+            log_state_error "Dirty state cannot be cleared: not found cleaning function or revert function for state '$STATE'."
+            pause;
+        fi
+        if [ -n "$ret" ]; then
+            if [[ "$RELOAD" == true || "$RELOCATE" == true ]]; then load; RELOAD=false; fi
+            if [ $ret != 0 ]; then
+                log_warn "Code $ret, failed to revert or clean the state '$state'. Retrying."
+            else
+                DIRTY=false;
+            fi;
+        fi
+    else # Advancing
+        log_info "At state '$state'"
+        if [ -z "${STATES_START_TIME[$state]}" ]; then STATES_START_TIME[$state]=$(timestamp); fi
+
+        set_dirty true; # Commit to disk
+        s_${state}; ret=$?
+
+        if [[ "$RELOAD" == true || "$RELOCATE" == true ]]; then load; RELOAD=false; fi # Some state functions may update state variables in subshell.
+        if [ $ret != 0 ]; then
+            log_warn "State '$state' failed with code $ret. Retrying."
+        else
+            DIRTY=false; # Commit to disk together with $next_state at the end of function
+            next_state=$(get_next_state)
+            STATES_FINISH_TIME[$state]=$(timestamp)
+        fi;
+    fi
+
+    if [ "$RELOCATE" == true ]; then
+        log_info "Relocating to STATE=$STATE, DIRTY=$DIRTY, PAUSED=$PAUSED"
+        RELOCATE=false;
+        store '' '' '';
+    else
+        log_info "Transfering to state STATE=$next_state, DIRTY=$DIRTY, PAUSED=$PAUSED"
+        store $next_state '' '';
+    fi
+    return $ret;
+}
+
+function walk_state()
+{
+    ensure_state_functions_defined;
+    redefine_error_loggers_with_dir;
+
+    lock_dir_100_or_exit;
+
+    walk_state_unlocked 2> >(last_error >&2);
+
+    unlock_dir_100;
+}
+
+function walk()
+{
+    ensure_state_functions_defined;
+    redefine_error_loggers_with_dir;
+
+    lock_dir_100_or_exit;
+
+    while true; do
+        walk_state_unlocked 2> >(last_error >&2);
+        if [ $? != 0 ]; then sleep 3; fi
+    done
+
+    unlock_dir_100;
+}
+
+## Functions for Task Management
+
+SYSTEMD_UNIT_FILES_DIR="/etc/systemd/system"
+
+function task_unit_file_exists() { [ -f $TASK_UNIT_FILE ]; }
+
+function ensure_task_unit_file_exists()
+{
+    if ! task_unit_file_exists; then
+        log_info "Directory '$RELATIVE_DIR' is not registered as a task in systemd. Please create the task with \`$PROG_NAME create $RELATIVE_DIR\` first."
+        exit 1;
+    fi
+}
+
+function list_tasks()
+{
+    local unit_files=$(ls $SYSTEMD_UNIT_FILES_DIR/chtm_*.service 2>/dev/null)
+    {
+        echo -e "Name\tState\tDirty\tPaused\tRevert To\tTask Directory\tLocked*\tSystemd Unit"
+        echo -e "────\t─────\t─────\t──────\t─────────\t──────────────\t───────\t────────────"
+        for f in $unit_files; do
+            local name=$(echo $f | sed -nr 's|.+/chtm_(.+).service|\1|gp')
+            local dir=$(awk '/^ExecStart/ {print$4}' $f | tr -d '"')
+            local state dirty paused revert locked
+            read state dirty paused revert locked < <(
+                DIR=$dir; load;
+                locked=''; dir_locked && locked='*';
+                echo "${STATE:-Unknown} ${DIRTY:-Unknown} ${PAUSED:-Unknown} ${REVERT:-N/A} $locked"
+            )
+            [ "$FLAG_LIST_RELATIVE" == true ] && dir=$(realpath -ms --relative-to="$PWD" "$dir") || :
+            echo -e "$name\t$state\t$dirty\t$paused\t$revert\t$dir\t$locked\t$(basename $f)"
+        done
+    } | mktable | sed "s|*|$BOLD$GREEN*$RST|g"
+}
+
+function prune_tasks()
+{
+    set -e;
+    local unit_files=$(ls $SYSTEMD_UNIT_FILES_DIR/chtm_*.service 2>/dev/null)
+    for f in $unit_files; do
+        local name=$(echo $f | sed -nr 's|.+/chtm_(.+).service|\1|gp')
+        local dir=$(awk '/^ExecStart/ {print$4}' $f | tr -d '"')
+        log_debug "Checking $name"
+        if ! [[ -f "$dir/state" || -f "$dir/config" ]]; then
+            if index_line 3 "$(systemctl status chtm_$name.service)" | grep -q "Active: active"; then
+                log_warn "Systemd unit chtm_$name.service is still running."
+            else
+                (
+                    systemctl disable chtm_$name.service
+                    systemctl stop chtm_$name.service
+                ) > /dev/null 2>&1
+                rm -rf "$f";
+                log_info "Directory '$dir' of task '$name' is missing or invalid, removed systemd unit $f"
+            fi
+        fi
+    done
+    systemctl daemon-reload;
+}
+
+function init_task()
+{
+    if [ -d $DIR ]; then
+        log_error "Directory '$RELATIVE_DIR' already exists."
+        return 1
+    fi
+(
+    set -e;
+    # Discover CLUSTER, EXPANDED_CLUSTER
+    if [ -z "$CLUSTER" ]; then
+        CLUSTER="{cluster}"
+        if [ -n "$CLUSTER" ]; then
+            log_info "Assigned default variable CLUSTER=$CLUSTER"
+        fi
+    fi
+    if ! EXPANDED_CLUSTER=$(expand_macro $CLUSTER); then
+        log_state_error "Error retrieving value of macro '$CLUSTER'."
+        exit 1
+    fi
+
+    if [[ -z "$LOCAL_TABLE" ]]; then
+        log_error "Variable 'LOCAL_TABLE' is not defined, please specify it with flag '--local <local_table_name>'"
+        exit 1;
+    fi
+    # Discover DATABASE
+    if [ -z "$DATABASE" ]; then
+        DATABASE=$(kube_chc_query "SELECT database FROM system.tables WHERE name='$LOCAL_TABLE'")
+        if [ -z "$DATABASE" ]; then
+            log_error "Cannot find database containing table '$LOCAL_TABLE'. Does the table exist ?"
+            exit 1
+        fi
+        if [ $(echo "$DATABASE" | wc -l) -gt 1 ]; then
+            log_error "Found more than 1 databases containing table named '$LOCAL_TABLE': $(tr '\n' ' ' <<<"$DATABASE"). Please specify it with flag '--db <database_name>'"
+            exit 1
+        fi
+        log_info "Assigned variable DATABASE=$DATABASE"
+    fi
+
+    exists=$(table_exists_on_cluster $LOCAL_TABLE)
+    if [ "$exists" == '0' ]; then
+        log_error "Table does not exist: $DATABASE.$LOCAL_TABLE"
+        exit 1
+    fi
+    # Discover DISTRIBUTED_TABLE
+    if [ -z "$DISTRIBUTED_TABLE" ]; then
+        DISTRIBUTED_TABLE=$(kube_chc_query "
+            SELECT table FROM system.tables WHERE engine='Distributed' AND database='$DATABASE' AND match(engine_full,'\'$DATABASE\'') AND match(engine_full,'\'$LOCAL_TABLE\'')
+            ")
+        if [ -z "$DISTRIBUTED_TABLE" ]; then
+            log_error "Cannot find distributed table for $DATABASE.$LOCAL_TABLE"
+            exit 1
+        fi
+        if [ $(echo "$DISTRIBUTED_TABLE" | wc -l) -gt 1 ]; then
+            log_error "Found more than 1 distributed tables for $DATABASE.$LOCAL_TABLE: $(tr '\n' ' ' <<<"$DISTRIBUTED_TABLE")"
+            exit 1
+        fi
+        log_info "Assigned variable DISTRIBUTED_TABLE=$DISTRIBUTED_TABLE"
+    fi
+    # Async discover DISTRIBUTED_TABLE_SHARDING_KEY
+    local tmp_ddl_distributed_table write_ddl_distributed_table_pid
+    if [ -z "$DISTRIBUTED_TABLE_SHARDING_KEY" ]; then
+        tmp_ddl_distributed_table=$(mktmp)
+        show_create_table $DISTRIBUTED_TABLE > $tmp_ddl_distributed_table &
+        write_ddl_distributed_table_pid=$!
+    fi
+
+    # Async discover NEW_DDL_REFERENCE, DDL_TEMPLATE
+    if [ -z "$NEW_DDL_REFERENCE" ]; then
+        NEW_DDL_REFERENCE=$LOCAL_TABLE.sql;
+        log_info "Assigned variable NEW_DDL_REFERENCE=$NEW_DDL_REFERENCE"
+    fi
+
+    mkdir -p $DIR; rm -rf $DIR/state.override;
+
+    local write_ddl_local_table_pid
+    if ! [ -f "$NEW_DDL_REFERENCE" ]; then
+        show_create_table $LOCAL_TABLE > $DIR/$NEW_DDL_REFERENCE &
+        write_ddl_local_table_pid=$!
+    else
+        command cp "$NEW_DDL_REFERENCE" $DIR/
+        NEW_DDL_REFERENCE=$(basename $NEW_DDL_REFERENCE)
+    fi
+
+    # Discover STATE_MigrateData_DATETIME_COLUMN
+    if [ -z "$STATE_MigrateData_DATETIME_COLUMN" ]; then
+        local res column type
+        res=$(kube_chc_query "
+            WITH (
+                SELECT splitByRegexp(', ', sorting_key)[1] FROM system.tables
+                WHERE (database = '$DATABASE') AND (table = '$LOCAL_TABLE')
+            ) AS key
+            SELECT name,type FROM system.columns
+            WHERE (database = '$DATABASE') AND (table = '$LOCAL_TABLE') AND (name = key)
+            ")
+        read column type <<<"$res"
+        if [[ -z "$column" || -z "$type" ]]; then
+            log_error "Not found sorting key of table $LOCAL_TABLE or cannot determine data type of first column in the sorting key."
+            exit 1;
+        fi
+        if [[ $column =~ [Tt]'ime' && $type =~ 'Int'|'DateTime' ]]; then # very likely
+            log_debug "Found sorting column '$column' of type '$type'"
+            STATE_MigrateData_DATETIME_COLUMN=$column;
+            log_info "Assigned variable STATE_MigrateData_DATETIME_COLUMN=$STATE_MigrateData_DATETIME_COLUMN"
+        fi
+    fi
+
+    # Finish discover DISTRIBUTED_TABLE_SHARDING_KEY
+    if [ -n "$write_ddl_distributed_table_pid" ]; then
+        wait $write_ddl_distributed_table_pid;
+        local engine_full
+        engine_full=$(sed -nr '/^ENGINE = Distributed/p' $tmp_ddl_distributed_table; rm -rf $tmp_ddl_distributed_table)
+        if [ -z "$engine_full" ]; then
+            log_error "Cannot retrieve ENGINE of distributed table '$DISTRIBUTED_TABLE'"
+            exit 1;
+        fi
+        local regex=", ([^ \)']+)\)$"
+        if [[ "$engine_full" =~ $regex ]]; then
+            DISTRIBUTED_TABLE_SHARDING_KEY=${BASH_REMATCH[1]}
+            log_info "Assigned variable DISTRIBUTED_TABLE_SHARDING_KEY=$DISTRIBUTED_TABLE_SHARDING_KEY"
+        fi
+    fi
+
+    # Finish discover DDL_TEMPLATE
+    if [ -n "$write_ddl_local_table_pid" ]; then
+        wait $write_ddl_local_table_pid;
+        log_info "Wrote file $RELATIVE_DIR/$NEW_DDL_REFERENCE"
+    fi
+
+    DDL_TEMPLATE=$(cat $DIR/$NEW_DDL_REFERENCE);
+    if [ -z "$DDL_TEMPLATE" ]; then
+        log_error "Unexpected error: DDL reference file is empty '$NEW_DDL_REFERENCE'"
+        exit 1;
+    fi
+
+    # Table structural changes
+
+    local engine partitionby primarykey orderby ttl settings
+    engine=$(sed -nr "s|^ENGINE = (.+)|\1|p" <<<"$DDL_TEMPLATE")
+    partitionby=$(sed -nr "s|^PARTITION BY (.+)|\1|p" <<<"$DDL_TEMPLATE")
+    primarykey=$(sed -nr "s|^PRIMARY KEY (.+)|\1|p" <<<"$DDL_TEMPLATE")
+    orderby=$(sed -nr "s|^ORDER BY (.+)|\1|p" <<<"$DDL_TEMPLATE")
+    ttl=$(sed -nr "s|^TTL (.+)|\1|p" <<<"$DDL_TEMPLATE")
+    settings=$(sed -nr "s|^SETTINGS (.+)|\1|p" <<<"$DDL_TEMPLATE")
+
+    if [ -n "$ENGINE" ]; then engine=${ENGINE%%+([[:space:]])}; fi
+    if [ -n "$PARTITIONBY" ]; then partitionby=${PARTITIONBY%%+([[:space:]])}; fi
+    if [ -n "$PRIMARYKEY" ]; then primarykey=${PRIMARYKEY%%+([[:space:]])}; fi
+    if [ -n "$ORDERBY" ]; then orderby=${ORDERBY%%+([[:space:]])}; fi
+    if [ -n "$TTL" ]; then ttl=${TTL%%+([[:space:]])}; fi
+
+    engine_full=$(echo "
+    ENGINE = $engine
+    PARTITION BY $partitionby
+    PRIMARY KEY $primarykey
+    ORDER BY $orderby
+    TTL $ttl
+    SETTINGS $settings
+    " | sed -r '/ $/d') # remove empty clauses
+
+    log_info "Assigned full engine to local table '$LOCAL_TABLE':${NC}$engine_full"
+
+    DDL_TEMPLATE=$(sed -nr "/^CREATE /,/^\)/p" <<<"$DDL_TEMPLATE")
+    DDL_TEMPLATE="$DDL_TEMPLATE$(unindent "$engine_full")"
+    echo "$DDL_TEMPLATE" > $DIR/$NEW_DDL_REFERENCE
+
+    store Initialize false false;
+    command cp --remove-destination $DIR/state $DIR/config;
+
+    log_info "Trying to initialize for validation..."
+    if ! s_Initialize; then
+        log_error "Initialization failed, please revise the command line arguments and \`init $RELATIVE_DIR\` again."
+        exit 1;
+    fi
+    WAIT_PAUSED=false store CreateTables false '';
+
+    log_info "Initialized task directory '$RELATIVE_DIR'."
+
+    if [ "$FLAG_CREATE" == true ]; then
+        INITIALIZED=true create_task;
+    fi
+)
+    local ret=$?
+    if [ $ret != 0 ]; then rm -rf $DIR; return $ret; fi
+}
+
+function create_task()
+{
+    if dir_locked; then
+        log_error "Directory is locked: '$DIR', maybe there's an already running instance. This is unexpected."
+        return 1;
+    fi
+
+    if [ "$INITIALIZED" != true ]; then
+        store Initialize false false
+        # Execute the initialization here to find out any configuration problem.
+        if ! s_Initialize; then
+            log_error "Initialization failed, please revise the configuration and create the task again."
+            return 1;
+        fi
+        WAIT_PAUSED=false store CreateTables false '';
+    fi
+
+    if task_unit_file_exists; then
+        if [ "$FLAG_FORCE" != true ]; then
+            log_error "Systemd unit file already exists: $TASK_UNIT_FILE"
+            return 1;
+        fi
+    fi
+
+    unindent "
+    [Unit]
+    Description=ClickHouse Table Structural Migration Task $TASK_NAME
+    After=network.target
+    # StartLimitIntervalSec=0
+
+    [Service]
+    Type=simple
+    Restart=on-failure
+    RestartSec=1
+    StartLimitInterval=0
+    User=root
+    WorkingDirectory=$(dirname $(realpath "$0"))
+    ExecStart=/bin/bash \"$(realpath "$0")\" walk \"$DIR\"
+    StandardOutput=syslog
+    StandardError=syslog
+    Environment=\"KUBECONFIG=$KUBECONFIG\" \"LOG_LEVEL=$LOG_LEVEL\"
+
+    [Install]
+    WantedBy=multi-user.target
+    " > $TASK_UNIT_FILE
+
+    log_info "Wrote systemd unit '$TASK_UNIT_FILE_NAME', file '$TASK_UNIT_FILE'"
+
+    if [ "$FLAG_START" == true ]; then
+        FLAG_DAEMON=true resume_task;
+    else
+        log_info "Run \`resume $RELATIVE_DIR --daemon\` to activate the task."
+    fi
+}
+
+function delete_task()
+{
+    set -e;
+    ensure_task_unit_file_exists;
+    load;
+
+    if [[ $STATE != 'Complete' && "$FLAG_FORCE" != true ]]; then
+        log_info "Task $TASK_NAME is not in Complete state, will not proceed."
+        return 1;
+    fi
+    # Ensure paused if not Complete
+    if dir_locked; then
+        if [ "$FLAG_PAUSE" == true ]; then
+            FLAG_DAEMON=true pause_task;
+        else
+            log_info "Task $TASK_NAME is running, will not proceed."
+            return 1;
+        fi
+        if dir_locked; then
+            log_warn "Task directory is still locked: there's a running process out of control of systemd. Please be careful."
+        fi
+    fi
+
+    rm -f $TASK_UNIT_FILE;
+    # systemctl daemon-reload # Is this necessary ?
+    log_info "Task $TASK_NAME unregistered."
+
+    if [ "$FLAG_DIRECTORY" == true ]; then
+        if ! dir_locked; then
+            rm -rf $DIR;
+            log_info "Removed task directory '$RELATIVE_DIR'."
+        else
+            log_error "Task directory '$RELATIVE_DIR' is locked, will not remove it."
+        fi
+    fi
+}
+
+function pause_task()
+{
+    flock -x $DIR/state echo "declare -g PAUSED=true" >> $DIR/state.override
+    load;
+
+    if [ "$FLAG_DAEMON" != true ]; then
+        log_info "Task $TASK_NAME state STATE=$STATE, PAUSED=$PAUSED"
+        return 0;
+    fi
+    if task_unit_file_exists; then
+        if ! await_running_instance; then
+            log_warn "Timed out (grace=${FLAG_GRACE}s), will force stop the active process."
+        fi
+        (
+            set -e
+            systemctl disable $TASK_UNIT_FILE_NAME
+            systemctl stop $TASK_UNIT_FILE_NAME # This command waits until the process is actually stopped.
+            log_info "Systemd unit $TASK_UNIT_FILE_NAME stopped."
+        )  > >(log_prefix "[systemctl]") 2> >(log_error_prefix "[systemctl]")
+    else
+        log_info "Task $TASK_NAME is not registered as a systemd service. Only changed state to STATE=$STATE, PAUSED=$PAUSED"
+    fi
+}
+
+function resume_task()
+{
+    if paused; then
+        flock -x $DIR/state echo "declare -g PAUSED=false" >> $DIR/state.override
+        load;
+        log_info "State resumed";
+    fi
+    if [ "$FLAG_DAEMON" != true ]; then
+        log_info "Task $TASK_NAME state STATE=$STATE, PAUSED=$PAUSED"
+        return 0;
+    fi
+    if task_unit_file_exists; then
+        (
+            set -e;
+            local now=$(datetime)
+            systemctl enable $TASK_UNIT_FILE_NAME
+            systemctl start $TASK_UNIT_FILE_NAME
+            log_info "Systemd unit $TASK_UNIT_FILE_NAME activated. Run \`journalctl -o cat -u $TASK_UNIT_FILE_NAME -f --since '$now' \` to follow log messages."
+        ) > >(log_prefix "[systemctl]") 2> >(log_error_prefix "[systemctl]")
+    fi
+}
+
+function restart_task()
+{
+    if dir_locked; then
+        FLAG_DAEMON=true pause_task;
+        if dir_locked; then
+            log_error "Task directory is still locked after 'systemctl stop': there's a running process out of control of systemd."
+            FLAG_DAEMON=false resume_task
+            return 1
+        fi
+    fi
+    FLAG_DAEMON=true resume_task
+}
+
+function revert_task()
+{
+    if [ $STATE == 'Complete' ]; then
+        log_warn "Task $TASK_NAME is completed, will not revert. Please create a new task instead."
+        return 1;
+    fi
+    local to=$STATE;
+    if [ -n "$FLAG_REVERT_TO" ]; then
+        if ! func_defined "s_$FLAG_REVERT_TO"; then
+            log_error "Unknown state '$FLAG_REVERT_TO', should be one of: $(IFS='|'; echo "${states[*]}")";
+            return 1;
+        fi
+        to=$FLAG_REVERT_TO
+    elif [ "$FLAG_ALL" == true ]; then
+        to='Initialize'
+    fi
+
+    flock -x $DIR/state echo "declare -g REVERT=$to PAUSED=false" >> $DIR/state.override
+    load;
+    if paused; then log_info "Will resume state."; resume_task; fi
+
+    log_info "Task $TASK_NAME state STATE=$STATE, REVERT=$REVERT"
+
+    if [ "$FLAG_DAEMON" == true ]; then
+        log_info "Restarting task '$RELATIVE_DIR'..."
+        restart_task;
+    elif dir_locked; then
+        log_warn "The running process will take the revert only after finishing current state. To apply it immediately, run command \`restart $RELATIVE_DIR\` afterwards."
+    fi
+}
+
+function dir_locked()
+{
+    flock -E 249 -xn $DIR true;
+    local ret=$?;
+    if [ $ret == 0 ]; then
+        return 1; # unlocked
+    elif [ $ret == 249 ]; then
+        return 0; # locked
+    else
+        log_error "Unknown error: cannot check locking status of task directory.";
+        exit 2;
+    fi
+}
+
+function await_running_instance()
+{
+    FLAG_GRACE=${FLAG_GRACE:-'0'}
+
+    if dir_locked; then
+        log_info "Waiting for running instance to stop..."
+        local start=$(timestamp_ms)
+        while (( $(timestamp_ms) - start <= FLAG_GRACE * 1000 )); do
+            if ! dir_locked; then break; fi
+            sleep 0.2;
+        done
+        # if timed out
+        if (( $(timestamp_ms) - start > FLAG_GRACE * 1000 )); then
+            return 1;
+        fi
+    else
+        log_info "No running instance found."
+    fi
+}
+
+function kube_chc_simple_query_pods()
+{
+    local -a server_pods=( $1 ); shift
+    local query=$1 prefix=$2 suffix=$3
+
+    local pids='';
+    trap_kill_group;
+
+    for pod in ${server_pods[@]}; do
+        kube_ch $pod clickhouse-client "$query" "${CHC_FLAGS[@]}" > $prefix$pod$suffix 2>/dev/null &
+        pids+=" $!"
+    done
+    for pid in $pids; do wait $pid; done
+
+    trap_restore_kill_group;
+}
+
+function two_column_if_needed()
+{
+    local header=$1 content=$(cat)
+    if [ ! "$FLAG_TWO_COLUMN" == true ]; then echo "$header"; echo "$content"; return; fi
+    local nr_lines=0 half=0 file1=$(mktmp) file2=$(mktmp)
+    nr_lines=$(echo "$content" | wc -l);
+    half=$(( (nr_lines + 1) / 2 ))
+    { echo "$header"; echo "$content" | head -n$half; } > $file1
+    { echo "$header"; echo "$content" | tail -n+$((half+1)); } | sed 's/^/│ /g' > $file2
+    paste -d $'\t' $file1 $file2
+    rm -f $file1 $file2
+}
+
+function format_readable_time_delta_compact()
+{
+    local sec=$1 zero_padding=$2
+    awk -v sec=$sec -v zero_padding=$zero_padding '
+        BEGIN {
+            f = zero_padding ? "%02d%s" : "%d%s"
+            d = int(sec / 86400); r = sec % 86400;
+            h = int(r / 3600); r %= 3600; m = int(r / 60); s = r % 60
+            s=sprintf("%s%s%s%s", component(d,"d"), component(h,"h"), component(m,"m"), component(s,"s"))
+            print s ? s : "0s"
+        }
+        function component(v,u){ return v>0 ? sprintf(f, v, u) : "" }
+    ' | sed -r 's|^(([0-9]+[dhms]){2}).*$|\1|' # preserve 2 parts for readability
+}
+
+function report_task()
+{
+    ensure_state_functions_defined;
+
+    local -A state_indexes=()
+    for i in ${!states[@]}; do s=${states[$i]}; state_indexes[$s]=$i; done
+
+    # overview
+    local locked; dir_locked && locked="$BOLD$GREEN*$RST" || :;
+    echo -en "\n${BOLD}Overview${RST}\n    STATE=$STATE  DIRTY=$DIRTY  PAUSED=$PAUSED  REVERT=${REVERT:-N/A}\n"
+
+    echo -en "\n${BOLD}States Flow ${RST}${FAINT}${ITALIC}($PROCEDURE)${RST}${locked}\n"
+    # state1 -> state2 -> state3 ...
+    local i=0 N=${#states[@]};
+    while ((i < N)); do
+        local s=${states[$i]}; ((++i));
+        if [ $s == $STATE ]; then echo -n "${BOLD}${BLUE}${UNDERLINE}${s}${RST}"; else echo -n "${s}"; fi
+        if [[ -n "${STATES_FINISH_TIME[$s]}" && -n "${STATES_FINISH_TIME[$s]}" ]]; then
+            echo -n "($( format_readable_time_delta_compact $((STATES_FINISH_TIME[$s] - STATES_START_TIME[$s])) ))"
+        elif [[ -n "${STATES_START_TIME[$s]}" ]]; then
+            echo -n "($( format_readable_time_delta_compact $(($(timestamp) - STATES_START_TIME[$s])) ))"
+        fi
+        if ((i < N)); then echo -n " → "; else echo; fi
+    done | folded_indent | sed -r "s|\([^\)]+\)|$FAINT$GREEN&$RST|g"
+
+    # state variables
+    if [ "$FLAG_VARIABLE" == true ]; then
+        echo -e "\n${BOLD}Variables${RST} "
+        for var in ${state_variables[@]}; do [[ $var =~ ^"STATE_${STATE}_" ]] && echo -e "$var\t=\t${!var:-DEFAULT}"; done | mktable | folded_indent
+    fi
+
+    # detail
+    echo -en "\n${BOLD}Detail:${RST} "
+
+    if [ $STATE == MigrateData ]; then
+        local query="
+            WITH
+                (SELECT count() FROM \`$DATABASE\`.\`$LOCAL_TABLE_DT\`) AS count_dt,
+                (SELECT count() FROM \`$DATABASE\`.\`$LOCAL_TABLE_CHAMELEON\`) AS count_chameleon
+            SELECT count_dt, count_chameleon, round(count_dt * 100 / count_chameleon, 5) AS progress
+            FORMAT TSVRaw
+        "
+        kube_chc_simple_query_pods "${SERVER_PODS[*]}" "$query" "$DIR/report.dt." ""
+
+        echo -e "Data migration progress\n"
+
+        local elapsed=$(($(timestamp) - STATES_START_TIME[MigrateData]))
+        local header=$(
+            echo -e "Pod\t DT Table\t Chameleon Table\t Progress %\t ETA"
+            echo -e "───\t ────────\t ───────────────\t ──────────\t ───"
+        )
+        {
+            for pod in ${SERVER_PODS[@]}; do
+                local count_dt count_chameleon progress
+                IFS=$'\t' read count_dt count_chameleon progress < <(cat $DIR/report.dt.$pod; rm -rf $DIR/report.dt.$pod)
+                local eta=$(
+                    eta_sec=$(awk "BEGIN { if($progress==0) {print "INF";exit} print int($elapsed / $progress * (100 - $progress) + 0.5) }")
+                    format_readable_time_delta_compact $eta_sec true
+                )
+                echo -e "$pod\t $count_dt\t $count_chameleon\t $progress\t $eta"
+            done
+        } | two_column_if_needed "$header" | mktable | folded_indent
+    elif [ $STATE == WaitMaterializationDone ]; then
+        local query="
+            WITH
+                ( SELECT count() FROM system.merges WHERE is_mutation AND database='$DATABASE' AND table='$LOCAL_TABLE_DT' ) AS executing_mutations
+            SELECT executing_mutations,parts_to_do,if((parts_to_do + executing_mutations) == 0, 'Yes', 'No') AS finished,left(latest_fail_reason,100) AS latest_fail_reason
+            FROM system.mutations
+            WHERE database='$DATABASE' AND table='$LOCAL_TABLE_DT' AND startsWith(command,'MATERIALIZE ')
+            ORDER BY is_done ASC, create_time DESC
+            LIMIT 1
+            FORMAT TSVRaw
+        "
+        kube_chc_simple_query_pods "${SERVER_PODS[*]}" "$query" "$DIR/report.mat." ""
+
+        echo -e "Progress on materialization of indexes and projections\n"
+
+        local header=$(
+            echo -e "Pod\t Parts Executing\t Parts To Do\t Finished\t Latest Fail Reason"
+            echo -e "───\t ───────────────\t ───────────\t ────────\t ──────────────────"
+        )
+        {
+            for pod in ${SERVER_PODS[@]}; do
+                local executing_mutations parts_to_do finished latest_fail_reason
+                IFS=$'\t' read executing_mutations parts_to_do finished latest_fail_reason < <(cat $DIR/report.mat.$pod; rm -rf $DIR/report.mat.$pod)
+                echo -e "$pod\t $executing_mutations\t $parts_to_do\t $finished\t $latest_fail_reason"
+            done
+        } | two_column_if_needed "$header" | mktable | folded_indent
+
+    elif [ $STATE == MovePartitions ]; then
+        local query="
+            SELECT count() AS parts_to_do,if(parts_to_do==0,'Yes','No') AS finished
+            FROM system.parts
+            WHERE active AND database='$DATABASE' AND table='$LOCAL_TABLE_DT'
+            FORMAT TSVRaw
+        "
+        kube_chc_simple_query_pods "${SERVER_PODS[*]}" "$query" "$DIR/report.move." ""
+
+        echo -e "Progress on MovePartitions\n"
+
+        local header=$(
+            echo -e "Pod\t Parts To Move\t Finished"
+            echo -e "───\t ─────────────\t ────────"
+        )
+        {
+            for pod in ${SERVER_PODS[@]}; do
+                local parts_to_do finished
+                IFS=$'\t' read parts_to_do finished < <(cat $DIR/report.move.$pod; rm -rf $DIR/report.move.$pod)
+                echo -e "$pod\t $parts_to_do\t $finished"
+            done
+        } | two_column_if_needed "$header" | mktable | folded_indent
+
+    elif (( ${state_indexes[$STATE]} >= ${state_indexes['Complete']} )); then
+        echo "Task Completed";
+        return 0;
+    elif (( ${state_indexes[$STATE]} >= ${state_indexes['ConsistencyReport']} )); then
+        echo -e "Data consistency report\n"
+        if [ -f "$DIR/consistency_report" ]; then
+            cat $DIR/consistency_report
+        else
+            log_error "File does not exist: $RELATIVE_DIR/consistency_report"
+        fi | folded_indent
+    else
+        echo "Unknown";
+    fi
+
+    # last error
+    echo -e "\n${BOLD}Most Recent Error Messages${RST}"
+    if [ -f "$DIR/last_error" ]; then
+        local errors starting_point
+        errors=$(cat $DIR/last_error | tail -20 | sed -r 's|^(.{640}).+|\1 ...|g')
+        starting_point=$(
+            {
+                echo "$errors" | grep -Po '\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}';
+                date -d @$(( $(date +%s) - 6*3600 )) +'%F %T.%3N ==SEPARATOR==';
+            } | sort | grep -n ==SEPARATOR== | cut -d: -f1
+        )
+        echo "$errors" | tail -n+$starting_point
+    fi
+}
+
+function print_vars()
+{
+    {
+        echo "${BOLD}All Available State Variables${RST}";
+        cat "$0" | sed -nr '/^declare -a state_variables/,/^\)/p' | grep -v 'Internal state' | indent
+
+        echo "${BOLD}State Variables Required in Configuration File${RST}";
+        cat "$0" | sed -nr '/^declare -a config_required_state_variables/,/^\)/p' | indent
+
+        echo "${BOLD}Procedures${RST}"
+        echo "# Run \`rearrange <TASK_DIR> <PROCEDURE>\` to switch procedure right after state Initialize, or specify procedure in 'init' command with flag --procedure." | indent
+        for p in ${procedures[*]}; do
+            echo "$p" | indent
+            eval "echo \${states_$p[@]}" | folded_indent 8
+        done
+
+    } | sed -r 's|(#.+)$|\x1b[32m\1\x1b[0m|g'
+}
+
+function set_task()
+{
+    local tmp;
+    while (($# > 0)); do
+        # name=value
+        if [[ "$1" =~ ^([a-zA-Z][a-zA-Z0-9_]+)'='.+$ ]]; then
+            local var=${BASH_REMATCH[1]}
+            if ! [[ " ${state_variables[*]} " =~ " $var " ]]; then
+                log_error "Unknown state variable '$var'. Run \`vars\` to check all available variables"
+                return 1;
+            fi
+            tmp="$tmp"$'\n'"declare -g $1"
+        else
+            log_error "Not an variable assignment: $1";
+            return 1;
+        fi
+        shift
+    done
+    flock -x $DIR/state echo "$tmp" >> $DIR/state.override
+    log_info "Wrote '$RELATIVE_DIR/state.override'"
+}
+
+declare -ga CHC_FLAGS=()
+
+# Set '--name=value' flags for clickhouse-client
+function set_chc_params()
+{
+    local override=${1:-'false'}; shift;
+    local arg name value prefix regex='^([0-9]+[KMGTP])i?B?$';
+    for arg; do
+        if [[ ! "$arg" =~ ^- ]]; then log_error "[set_chc_params] Argument to pass to clickhouse-client should start with '-' or '--'."; exit 1; fi
+        if [[ "$arg" =~ '=' ]]; then # has value
+            name=${arg%%=*}; value=${arg#*=};
+            [[ $value =~ $regex ]] && value=$(numfmt --from=iec --to=none ${BASH_REMATCH[1]}) || :;
+            prefix="$name=";
+            arg="$name=$value";
+        else
+            prefix="$arg";
+        fi
+        local i=$(
+            i=0;
+            for x in ${CHC_FLAGS[@]}; do if [[ "$x" =~ ^"$prefix" ]]; then echo $i; break; fi; ((++i)); done
+        )
+        if [ -n "$i" ]; then
+            if [ "$override" == true ]; then
+                unset "CHC_FLAGS[$i]";
+            else
+                continue;
+            fi
+        fi
+        CHC_FLAGS=( "${CHC_FLAGS[@]}" "$arg" );
+    done;
+}
+
+function get_server_pods()
+{
+    if ! command -v kubectl >/dev/null; then
+        log_error "Command 'kubectl' not found."
+        return 1;
+    fi
+
+    local ns=$1
+    if [ -n "$ns" ]; then
+        if ! $KUBECTL get ns "$ns" >/dev/null; then
+            log_error "Cannot find namespace $ns."
+            return 1;
+        fi
+        KUBECTL="$KUBECTL -n $ns";
+    fi
+    declare -ga SERVER_PODS=( $($KUBECTL get pods -l $CLICKHOUSE_SERVER_POD_LABEL -oname | cut -d/ -f2) )
+
+    if ((${#SERVER_PODS[@]} == 0)); then
+        log_error "Cannot find any ClickHouse server PODs in namespace $ns."
+        return 1;
+    fi
+    # Verify these are actually ClickHouse PODs
+    local res=$(kube_chc_query_all "SELECT 1") regex="^1{${#SERVER_PODS[@]}}\$"
+    if ! [[ "$(echo "$res" | tr -d '\n')" =~ $regex ]]; then
+        log_error "All PODs should be healthy ClickHouse server, but some are not responding to query 'SELECT 1'. Results: \n$res"
+        return 1;
+    fi
+    log_debug "Server PODs: ${SERVER_PODS[*]}"
+
+    # Randomly pick one POD, prefer -1 replicas
+    local idx rand=$RANDOM
+    if [[ "${SERVER_PODS[*]}" =~ '-1-0'$ ]]; then rand=$((rand * 2 + 1)); fi
+    idx=$((rand % ${#SERVER_PODS[@]}))
+    declare -g POD0=${SERVER_PODS[$idx]}
+}
+
+declare -gx KUBECTL=${KUBECTL:-kubectl}
+declare -g CLICKHOUSE_SERVER_POD_LABEL='clickhouse.altinity.com/chi'
+
+function usage()
+{
+    unindent "
+        Usage:  $PROG_NAME  <COMMAND>  [TASK_DIR]  <[FLAG] | SET_VARS | PROCEDURE>...
+
+            1) $PROG_NAME  list|prune|vars  [FLAG]...
+            2) $PROG_NAME  init|create|delete|revert|pause|resume|restart|report|set|walk|walk_state  <TASK_DIR>  [FLAG]...
+            3) $PROG_NAME  set  <TASK_DIR>  <SET_VARS>...
+            4) $PROG_NAME  rearrange  <TASK_DIR>  PROCEDURE"
+
+    local raw_content=$(sed -n '/^#>>> ARGUMENT BEGIN/,/^#>>> ARGUMENT END/p' $0)
+    {
+        echo "$raw_content" | sed -n '/^#>>> COMMAND ARGUMENT BEGIN/,/^#>>> COMMAND ARGUMENT END/p'
+        echo "$raw_content" | sed -n '/^#>>> FLAG ARGUMENT BEGIN/,/^#>>> FLAG ARGUMENT END/p';
+    } \
+    | sed -nr '
+            /^## ?/{ s|^## ?||; p }
+            /^ {8}(-*[a-zA-Z0-9\|_\-]+)\)/{ s| +#:|: #|; s|^ {4}||; p }
+            /^ {12,}#.+/{ p }
+            /^ {4}#/{ s|^ {4}# ?||g; p }
+        ' \
+    | awk -F'#' '{ h=$1; $1=""; printf("%-24s%s\n",h,$0) }'
+
+    unindent "
+    Definitions
+      'procedure'  A sequence of states that are mostly revertable with best effort.
+      'state'      A defined set of actions to do, based on some prerequisites, to establish new prerequisites for the next state.
+                   The actions are mostly revertable with best effort. A temporary 'try->fail->revert->retry' loop may occur.
+      'Chameleon table'   The table with new structure created in state CreateTables, exchanged with the original \$LOCAL_TABLE
+                          table in state SwapTables. Therefore it refers to the new empty table before state SwapTables and to
+                          the original table after state SwapTables, thus the name 'chameleon'.
+      'DT table'    A table with new structure created in state CreateTables alongside the 'Chameleon table'. It is used to
+                    transform data from the original \$LOCAL_TABLE table, which is named <LOCAL_TABLE>__CHAMELEON after tables
+                    swapped. On completing data transformation, all partitions will be moved from DT table to the new
+                    \$LOCAL_TABLE table during state MovePartitions.
+
+    Examples
+        1. Initialize a task directory and register as systemd unit
+            $PROG_NAME  init  tcp_log_local  --create --cluster '{cluster}' --db business --local tcp_log_local --procedure simple
+
+        2. Configure the task to drop chameleon table in DropTables state
+            $PROG_NAME  set  tcp_log_local  STATE_DropTables_DROP_OLD_TABLE=true
+
+        3. Rearrange to 'full' procedure. This should be done right after state Initialize
+            $PROG_NAME  rearrange  tcp_log_local  full
+
+    Note
+        Please ensure the 'default' account (or the account specified via --chc \"--user=<username>\") is authorized throughout the
+        cluster to CREATE, DROP, INSERT INTO new tables, query on system tables and the target table. Otherwise the script is unable
+        to carry out the task correctly, for example, runs into a wrong procedure 'simplest' which presumes chameleon table to be empty."
+}
+
+function normalize_opts()
+{
+    local raw_opts=$(sed -n '/^#>>> ARGUMENT BEGIN/,/^#>>> ARGUMENT END/p' $0 \
+        | sed -nr '
+                /^ {8}(-+[a-zA-Z0-9\|_\-]+)\)/ {
+                    s| *\) *#:|:#|           # argument indicator #:
+                    s| *#.*$||; s|[ \)]||g   # remove comments, parentheses, whitespaces
+                    s/\|/\n/g                # substitute | with \n
+                    /:$/ { s|:?$|:|gm }      # populate the argument indicator :
+                    s|^-+||gm                # remove leading dash -
+                    p
+                }
+            '
+    )
+    local short_opts=$(echo "$raw_opts" | awk '/^.:?$/ {print$0}' | tr -d '\n')
+    local long_opts=$(echo "$raw_opts" | awk '/^[^:]{2,}:?$/ {print$0}' | tr '\n' ',' | sed 's/,$//')
+    getopt -n $PROG_NAME -o $short_opts -l $long_opts -- "$@"
+}
+opts=$(normalize_opts "$@") || exit 1
+eval "set -- $opts"
+
+expected_arg_type='COMMAND'
+
+while (( $# > 0 )); do
+#>>> ARGUMENT BEGIN
+    if [[ "$1" == '--' ]]; then shift; continue; fi
+    if [[ $expected_arg_type = 'FLAG' || "$1" =~ ^'-'.+ ]]; then
+        case $1 in
+#>>> FLAG ARGUMENT BEGIN
+##
+## Flags for command init
+        --create) # Create the task as well. As if `init <TASK_DIR>` followed by `create <TASK_DIR>`
+            FLAG_CREATE=true;
+            shift;;
+        --cluster) #: The CLUSTER variable.
+            CLUSTER=$2
+            shift 2;;
+        --db|--database) #: The DATABASE variable.
+            DATABASE=$2
+            shift 2;;
+        --distributed) #: The DISTRIBUTED_TABLE variable.
+            DISTRIBUTED_TABLE=$2
+            shift 2;;
+        --shardingkey) #: The DISTRIBUTED_TABLE_SHARDING_KEY variable.
+            DISTRIBUTED_TABLE_SHARDING_KEY=$2
+            shift 2;;
+        --local) #: The LOCAL_TABLE variable. Mandatory.
+            LOCAL_TABLE=$2
+            shift 2;;
+        --reference-file) #: File that stores DDL query of the new table. The NEW_DDL_REFERENCE variable
+            NEW_DDL_REFERENCE=$2
+            shift 2;;
+        --partitionby) #: Creates a template DDL from existing $LOCAL_TABLE with different PARTITION BY clause.
+            PARTITIONBY=$2
+            shift 2;;
+        --primarykey) #: Creates a template DDL from existing $LOCAL_TABLE with different PRIMARY KEY clause.
+            PRIMARYKEY=$2
+            shift 2;;
+        --orderby) #: Creates a template DDL from existing $LOCAL_TABLE with different ORDER BY clause.
+            ORDERBY=$2
+            shift 2;;
+        --ttl) #: Creates a template DDL from existing $LOCAL_TABLE with different TTL clause.
+            TTL=$2
+            shift 2;;
+        --procedure) #: The PROCEDURE variable.
+            PROCEDURE=$2
+            shift 2;;
+        --states) #: The `states' variable.
+            PROCEDURE='CUSTOM'
+            states=(${2//,/ })
+            ensure_state_functions_defined
+            shift 2;;
+        -v) #: Specify variable assignments. For exmaple the flag --shardingkey 'rand()' can also be
+            # given as -v 'DISTRIBUTED_TABLE_SHARDING_KEY="rand()"'. Can be specified multiple times.
+            # Note: Please note the extra quotes if there are spaces inside the value:
+            #     -v "name='v a l u e'"
+            #     -v 'name="v a l u e"'
+            #     -v "name=\"v a l u e\""
+            if [[ "$2" =~ ^[a-zA-Z][a-zA-Z0-9_]+'='.+$ ]]; then eval "$2"; else log_error "Not an variable assignment: $2"; exit 1; fi
+            shift 2;;
+##
+## Flags for command list
+        --relative) # Display task directory path as relative to current working directory.
+            FLAG_LIST_RELATIVE=true
+            shift;;
+##
+## Flags for command create
+        --start) # Start the newly created task immediately
+            FLAG_START=true
+            shift;;
+##
+## Flags for command revert
+        --all) # Revert all operations that a task has done.
+            FLAG_ALL=true
+            shift;;
+        --to) #: Revert all operations back until this state.
+            FLAG_REVERT_TO=$2
+            shift 2;;
+##
+## Flags for command delete
+        --pause) # Pause the task first.
+            FLAG_PAUSE=true
+            shift;;
+        --directory) # Delete task directory.
+            FLAG_DIRECTORY=true
+            shift;;
+##
+## Flags for command report
+        -2|--two-column) # Display detail of task in 2 columns.
+            FLAG_TWO_COLUMN=true
+            shift;;
+        --var) # Display variables for current state.
+            FLAG_VARIABLE=true
+            shift;;
+##
+## Common flags
+        --ns|--namespace) #: Kubernetes namespace where ClickHouse cluster lives. Applies to command 'init', 'create'.
+            if ! kubectl get ns "$2" >/dev/null; then exit $?; fi
+            KUBECTL="$KUBECTL -n $2"
+            shift 2;;
+        --k8s-label) #: Kubernetes POD label of ClickHouse servers. Defaults to 'clickhouse.altinity.com/chi' Applies
+            # to command 'init', 'create'.
+            CLICKHOUSE_SERVER_POD_LABEL=$2
+            shift 2;;
+        --chc) #: A single string containing flags to pass to clickhouse-client. Value of a flag should be directly
+            # connected to the flag by equal sign '='. e.g. --chc "--echo -n --max_threads=4". Can be specified multiple
+            # times.
+            set_chc_params true $2;
+            shift 2;;
+        --force) # Force action on command 'create', 'delete'
+            FLAG_FORCE=true
+            shift;;
+        -d|--daemon) # Activate/deactivate systemd services. Without the flag, commands 'pause', 'resume', 'revert' only change
+            # state variables in task directory. Applies to command 'pause', 'resume', 'revert'
+            FLAG_DAEMON=true
+            shift;;
+        --grace) #: Wait for some time before killing the task process. Defaults to 0 seconds. Applies to command 'pause',
+            # 'delete'
+            FLAG_GRACE=$2
+            if ! [[ "$FLAG_GRACE" =~ ^[0-9]+$ ]]; then log_error "Value of --grace should be an ingeter number, got '$2'"; exit 1; fi
+            shift 2;;
+        --ech) #: --ech flags to pass to for_each_line2.sh
+            ECH_FLAGS+=(--ech "$2");
+            shift 2;;
+        --dry) # Dry run. Debugging usage only.
+            DRY_RUN=true;
+            shift;;
+        --log-level) #: Logging level. It's persisted for the entire task if specified in command 'create'.
+            LOG_LEVEL=$2;
+            if [ -z "${LOG_LEVELS[$LOG_LEVEL]}" ]; then echo "Unknown log level $LOG_LEVEL, should be one of ${!LOG_LEVELS[@]}"; exit 1; fi
+            shift 2;;
+        -h|--help) # This help text.
+            usage; exit 0;;
+        *)
+            log_error "Unknown flag: $1";
+            usage; exit 1;
+        esac;
+#>>> FLAG ARGUMENT END
+#>>> COMMAND ARGUMENT BEGIN
+##
+## Commands
+    elif [ $expected_arg_type = 'COMMAND' ]; then
+        case $1 in
+        list) # List all tasks that are registered as systemd services.
+            ;;
+        init) # Initialize a task directory.
+            ;;
+        create) # Create a new task from an existing task directory. A newly created task is put in paused state, with
+            # --start flag to run it immediately. With --force to overwrite an existing systemd service.
+            ;;
+        delete) # Delete systemd unit file of a task. The task should be in Complete state, or with --force flag to delete a
+            # paused task. With both flags --force and --pause to pause a running task and delete it (at your own risk).
+            # With flag --directory to remove the task directory.
+            ;;
+        prune) # Delete inactive systemd units of which the task directory does not exist.
+            ;;
+        revert) # Revert operations that current state of the task has done. With --all to revert all operations that a task
+            # has done. With --to STATE_NAME to revert all operations back until STATE_NAME. The running process will
+            # take the revert only after finishing current state. To apply it immediately, specify --daemon flag to
+            # restart the running daemon process. Or run 'restart' afterwards.
+            # Note: Tasks cannot be reverted in and after state MovePartitions.
+            ;;
+        pause) # Pause a task. By default this command only modifies states in task directory, with --deamon flag to
+            # actually deactivate the systemd service. With --grace to wait for some time (defaults to 0 seconds) before
+            # killing the process.
+            ;;
+        resume) # Resume a paused task. By default this command only modifies states in task directory, with --deamon flag
+            # to actually activate the systemd service.
+            ;;
+        restart) # Restart the task.
+            ;;
+        report) # Report task progress or result of some state.
+            ;;
+        vars) # List all configurable state variables, also list the variables that are mandatory in 'config' file.
+            ;;
+        set) # Set state variables for a task. For example: set <TASK_DIR> "STATE_ConsistencyReport_TIMESLOT_INTERVAL='1 HOUR'"
+            # Ensure to quote the assignment with extra quotation marks if value contains some spaces,
+            # like 'var="va lue"', "var='va lue'", or "var=\"va lue\"", instead of var="va lue"
+            ;;
+        rearrange) # Rearrange procedures. Run `vars` to check all predefined procedures.
+            ;;
+        walk) # Execute util the end of the task.
+            ;;
+        walk_state) # Execute steps of current state.
+            ;;
+        *)
+            log_error "Unknown command '$1', expecting one of list|init|create|delete|prune|revert|pause|resume|restart|report|vars|set|rearrange|walk|walk_state"
+            exit 1;
+            ;;
+        esac
+        COMMAND=$1
+        if [ $COMMAND == 'list' ]; then
+            expected_arg_type='FLAG';
+        elif [ $COMMAND == 'prune' ]; then
+            prune_tasks; exit $?; # No state dependencies.
+        elif [ $COMMAND == 'vars' ]; then
+            print_vars; exit $?; # No state dependencies.
+        else
+            expected_arg_type='TASK_DIR'
+        fi
+        shift;
+    elif [ $expected_arg_type = 'SET_VARS' ]; then
+        set_task "$@"; exit $?;
+    elif [ $expected_arg_type = 'PROCEDURE' ]; then
+        expected_arg_type='FLAG';
+        switch_procedure $1;
+        exit $?;
+    elif [ $expected_arg_type = 'TASK_DIR' ]; then
+        if [[ -z "$1" || "$1" =~ ^-.* ]]; then log_error "Expected argument type <TASK_DIR>, got likely <FLAG> = '$1'"; usage; exit 1; fi
+        if [[ "$1" =~ [[:space:]] ]]; then log_error "The task directory path contains spaces, which is not supported."; exit 1; fi
+        if [ ! -d "$1" ] && [ $COMMAND != 'init' ]; then log_error "Task directory should be a path to an existing directory, got <TASK_DIR> = '$1'"; exit 1; fi
+        if dir_is_root "$1"; then log_error "Refusing to use root as task directory"; exit 1; fi
+
+        # Base variable DIR
+        DIR=$(realpath -ms "$1")
+        if [ -z "$DIR" ]; then log_error "Task directory should be a path to an existing directory, got <TASK_DIR> = '$DIR'"; exit 1; fi
+
+        RELATIVE_DIR=$(realpath -ms --relative-to="$PWD" "$1")
+        if [ ${#RELATIVE_DIR} -ge ${#DIR} ]; then RELATIVE_DIR=$DIR; fi
+
+        # Task management variables
+        TASK_NAME=$(basename "$DIR")
+        TASK_UNIT_FILE_NAME="chtm_$TASK_NAME.service"
+        TASK_UNIT_FILE="$SYSTEMD_UNIT_FILES_DIR/$TASK_UNIT_FILE_NAME"
+
+        # load state if <TASK_DIR> is ready.
+        if ! [[ $COMMAND =~ ^('init'|'create')$ ]]; then load; fi
+
+        if [ $COMMAND == 'set' ]; then
+            expected_arg_type='SET_VARS';
+        elif [ $COMMAND == 'rearrange' ]; then
+            expected_arg_type='PROCEDURE';
+        else
+            expected_arg_type='FLAG';
+        fi
+        shift;
+    else
+        log_error "Logical Error: Unknown argument type <$expected_arg_type>.";
+        usage; exit 1;
+    fi
+#>>> COMMAND ARGUMENT END
+#>>> ARGUMENT END
+done
+
+# Incomplete arguments
+if [ $expected_arg_type != 'FLAG' ]; then
+    log_error "Expecting argument of type <$expected_arg_type>.";
+    usage; exit 1;
+fi
+
+# Get server PODs if not already.
+if ! [[ $COMMAND =~ 'list'|'prune'|'vars' ]]; then
+    if [ -z "$POD0" ]; then
+        if ! get_server_pods; then exit $?; fi
+    fi
+fi
+
+if [[ "$COMMAND" == walk || "$COMMAND" == walk_state ]]; then
+    $COMMAND
+    exit $?
+fi
+
+if ! command -v systemctl >/dev/null; then
+    log_error "Command 'systemctl' not found. It's needed for task management."
+    exit 1;
+fi
+
+if func_defined ${COMMAND}_tasks; then
+    ${COMMAND}_tasks;
+else
+    ${COMMAND}_task;
+fi
